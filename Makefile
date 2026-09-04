@@ -25,7 +25,11 @@ DEEPSEEK_MODEL ?= deepseek/deepseek-v4-flash-0731
 GPT_OSS_MODEL ?= openai/gpt-oss-120b
 MODEL_TAG ?= $(subst /,-,$(MODEL))
 COMPACT_THRESHOLD ?= 6000
+COMPACTION_MAX_TOKENS ?= 1600
 STEPS ?= 200
+SWEBENCH_STEPS ?= 20
+SWEBENCH_TIMEOUT ?= 3600
+CODE_TOOL_INTERFACE ?= legacy
 CHESS_TIMEOUT ?= 1800
 OBS_NO_LEGAL_TRAJECTORY ?= artifacts/part3-no-legal-moves-$(MODEL_TAG).json
 OBS_LEGAL_TRAJECTORY ?= artifacts/part3-legal-moves-$(MODEL_TAG).json
@@ -107,6 +111,7 @@ check-swebench-local:
 
 run-code-agent:
 	uv run assignment-code-agent --task $(TASK) --model $(MODEL) --step-limit $(STEPS) \
+		--tool-interface $(CODE_TOOL_INTERFACE) \
 		--skills-path $(CODE_SKILLS) --trajectory $(PART1_TRAJECTORY) \
 		--patch-output $(PATCH)
 
@@ -115,7 +120,7 @@ run-code-agent-local:
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-code-agent --backend docker --task $(TASK) --model "$(LOCAL_MODEL)" \
-		--step-limit $(STEPS) --skills-path $(CODE_SKILLS) \
+		--step-limit $(STEPS) --tool-interface $(CODE_TOOL_INTERFACE) --skills-path $(CODE_SKILLS) \
 		--trajectory $(LOCAL_PART1_TRAJECTORY) --patch-output $(LOCAL_PATCH)
 
 # Run the code agent on a vendored SWE-bench instance, in its published image.
@@ -124,7 +129,10 @@ run-swebench-agent:
 		--patch-output $(SWEBENCH_PATCH) \
 		--trajectory $(SWEBENCH_TRAJECTORY) \
 		--skills-path $(CODE_SKILLS) \
-		--step-limit $(STEPS) $(if $(filter-out 0,$(COMPACT_THRESHOLD)),--compact-threshold-tokens $(COMPACT_THRESHOLD),)
+		--tool-interface $(CODE_TOOL_INTERFACE) \
+		--step-limit $(SWEBENCH_STEPS) --sandbox-timeout $(SWEBENCH_TIMEOUT) \
+		--compaction-max-tokens $(COMPACTION_MAX_TOKENS) \
+		$(if $(filter-out 0,$(COMPACT_THRESHOLD)),--compact-threshold-tokens $(COMPACT_THRESHOLD),)
 
 run-swebench-agent-local:
 	$(LOCAL_DOCKER_ENV) \
@@ -132,7 +140,9 @@ run-swebench-agent-local:
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-swebench-agent --backend docker $(INSTANCE) --model "$(LOCAL_MODEL)" \
 		--patch-output $(SWEBENCH_PATCH) --trajectory $(SWEBENCH_TRAJECTORY) \
-		--skills-path $(CODE_SKILLS) --step-limit $(STEPS) \
+		--skills-path $(CODE_SKILLS) --tool-interface $(CODE_TOOL_INTERFACE) \
+		--step-limit $(SWEBENCH_STEPS) --sandbox-timeout $(SWEBENCH_TIMEOUT) \
+		--compaction-max-tokens $(COMPACTION_MAX_TOKENS) \
 		$(if $(filter-out 0,$(COMPACT_THRESHOLD)),--compact-threshold-tokens $(COMPACT_THRESHOLD),)
 
 run-chess-agent:

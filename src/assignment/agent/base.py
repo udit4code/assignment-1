@@ -28,15 +28,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_COMPACTION_KEEP_RECENT_STEPS = 1
 DEFAULT_COMPACTION_MAX_TOKENS = 1_200
 MAX_COMPACTION_ATTEMPTS = 3
-MAX_OBSERVATION_CHARS = 10_000
+MAX_OBSERVATION_CHARS = 6_000
+MIN_COMPACTION_STEP_INTERVAL = 3
 
 COMPACTION_SYSTEM_PROMPT = """You create concise, factual working memory for a
 software agent. Summarize only the supplied older conversation. Preserve the
 objective and constraints; relevant files, symbols, and commands; edits already
 made; concrete results and errors; failed approaches and why they failed; tests
-and their outcomes; current blockers; and the next intended action. Do not copy
-large raw outputs, invent facts, or include conversational filler. Return only
-the working-memory summary."""
+and their outcomes; current blockers; and the next intended action. Clearly
+distinguish facts supplied by the task from facts verified through tool output.
+Never say that code was changed, a reproduction was run, or tests passed unless
+a tool observation confirms it. Record repeated or no-progress actions and make
+the next intended action materially different from them. Do not copy large raw
+outputs, invent facts, or include conversational filler. Return only the
+working-memory summary."""
 
 
 class StepLimitError(Exception):
@@ -50,21 +55,39 @@ class EmptyCompactionSummaryError(RuntimeError):
 def format_tool_output(output: dict[str, Any]) -> str:
     """Format a terminal result as a compact, tagged model observation."""
 
+    visible = dict(output)
+    combined = visible.get("output")
+    stdout = visible.get("stdout")
+    stderr = visible.get("stderr")
+    if (
+        isinstance(combined, str)
+        and isinstance(stdout, str)
+        and isinstance(stderr, str)
+        and combined == stdout + stderr
+    ):
+        # Environment.execute() exposes split streams for diagnostics and a
+        # combined stream for the model. Don't send the same terminal output
+        # three times.
+        visible.pop("stdout", None)
+        visible.pop("stderr", None)
+
     elements: list[str] = []
-    for key in sorted(output):
-        value = output[key]
-        if isinstance(value, str) and len(value) > MAX_OBSERVATION_CHARS:
-            # Leave room for the elision notice so the formatted value itself,
-            # not just its retained source slices, stays below the limit.
-            retained_at_each_end = 4_900
-            omitted = len(value) - (2 * retained_at_each_end)
-            value = (
-                f"{value[:retained_at_each_end]}\n"
-                f"[{omitted} characters elided; read a narrower range]\n"
-                f"{value[-retained_at_each_end:]}"
-            )
+    for key in sorted(visible):
+        value = visible[key]
         elements.append(f"<{key}>{value}</{key}>")
-    return "\n".join(elements)
+    formatted = "\n".join(elements)
+    if len(formatted) <= MAX_OBSERVATION_CHARS:
+        return formatted
+
+    # Bound the whole observation, not each field independently. Retaining both
+    # ends preserves the command's opening context and its final error/summary.
+    retained_at_each_end = 2_900
+    omitted = len(formatted) - (2 * retained_at_each_end)
+    return (
+        f"{formatted[:retained_at_each_end]}\n"
+        f"[{omitted} characters elided; read a narrower range]\n"
+        f"{formatted[-retained_at_each_end:]}"
+    )
 
 
 def rough_message_tokens(messages: list[dict[str, Any]]) -> int:
@@ -160,10 +183,13 @@ class Agent:
         self.api_prompts: list[list[dict[str, Any]]] = []
         self.api_responses: list[dict[str, Any]] = []
         self.compaction_events: list[dict[str, Any]] = []
+        self.last_compaction_step: int | None = None
         self.tools: list[dict[str, Any]] = []
         # Subclasses may require a structured action on every turn. Most agents
         # leave this unset so the provider retains its default "auto" behavior.
         self.tool_choice: str | None = None
+        self.reasoning_effort = "medium"
+        self.compaction_reasoning_effort = "low"
         self.finished = False
         self.steps_taken = 0
 
@@ -295,7 +321,7 @@ class Agent:
                 if self.api_style == "ollama"
                 else {
                     "max_completion_tokens": 4096,
-                    "reasoning_effort": "medium",
+                    "reasoning_effort": self.reasoning_effort,
                 }
             )
             if self.tool_choice is not None:
@@ -451,7 +477,7 @@ class Agent:
             if self.api_style == "ollama"
             else {
                 "max_completion_tokens": self.compaction_max_tokens,
-                "reasoning_effort": "medium",
+                "reasoning_effort": self.compaction_reasoning_effort,
             }
         )
         compaction_response = self.client.chat.completions.create(
@@ -483,6 +509,13 @@ class Agent:
         """Compact before the next action request when the threshold is reached."""
 
         if not self.compaction_enabled:
+            return False
+
+        if (
+            self.last_compaction_step is not None
+            and self.steps_taken - self.last_compaction_step
+            < MIN_COMPACTION_STEP_INTERVAL
+        ):
             return False
 
         # Context too short to compact yet
@@ -522,6 +555,7 @@ class Agent:
                 "compaction_response": compaction_response,
             }
         )
+        self.last_compaction_step = self.steps_taken
         return True
 
     def run(self) -> None:
@@ -532,6 +566,15 @@ class Agent:
                 if self.steps_taken >= self.step_limit:
                     raise StepLimitError(
                         f"Agent reached its step limit of {self.step_limit}."
+                    )
+
+                remaining_steps = self.step_limit - self.steps_taken
+                if remaining_steps in {10, 5, 1}:
+                    print(
+                        f"[agent] warning: {remaining_steps} action step(s) "
+                        "remaining; prioritize implementation, verification, "
+                        "and completion.",
+                        flush=True,
                     )
 
                 self.maybe_compact_context()

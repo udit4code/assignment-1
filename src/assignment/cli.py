@@ -70,6 +70,27 @@ def _add_code_agent_arguments(parser: argparse.ArgumentParser) -> None:
     """The arguments both code-agent runners take, so they cannot drift apart."""
     parser.add_argument("--model")
     parser.add_argument("--step-limit", type=int, default=100)
+    parser.add_argument(
+        "--tool-interface",
+        choices=CodeAgent.TOOL_INTERFACES,
+        default="legacy",
+        help=(
+            "legacy is the assignment-compatible execute/send_message interface; "
+            "capability is an experimental phase-specific interface"
+        ),
+    )
+    parser.add_argument(
+        "--discovery-inspection-limit",
+        type=int,
+        default=CodeAgent.DEFAULT_DISCOVERY_INSPECTION_LIMIT,
+        help="maximum read-only commands before an implementation is required",
+    )
+    parser.add_argument(
+        "--phase-inspection-limit",
+        type=int,
+        default=CodeAgent.DEFAULT_PHASE_INSPECTION_LIMIT,
+        help="read-only commands allowed after a failed edit or before verification",
+    )
     _add_backend_arguments(parser)
     _add_compaction_argument(parser)
     parser.add_argument(
@@ -170,13 +191,13 @@ def run_code_agent() -> None:
             compact_threshold_tokens=args.compact_threshold_tokens,
             compaction_keep_recent_steps=args.compaction_keep_recent_steps,
             compaction_max_tokens=args.compaction_max_tokens,
+            discovery_inspection_limit=args.discovery_inspection_limit,
+            phase_inspection_limit=args.phase_inspection_limit,
+            tool_interface=args.tool_interface,
             skills_path=str(args.skills_path) if args.skills_path else None,
         )
         agent.run()
-        output = environment.execute("cat patch.txt")
-        if output["returncode"] != 0:
-            raise SystemExit("Error reading agent-produced patch")
-        submitted_patch = output["output"]
+        submitted_patch = agent.submitted_patch
 
     if not submitted_patch.strip():
         raise SystemExit("Agent finished without a non-empty patch.")
@@ -192,27 +213,43 @@ def run_swebench_agent() -> None:
     parser = argparse.ArgumentParser(description=run_swebench_agent.__doc__)
     parser.add_argument("instance_id")
     _add_code_agent_arguments(parser)
+    parser.add_argument(
+        "--sandbox-timeout",
+        type=int,
+        default=3600,
+        help="maximum sandbox lifetime in seconds",
+    )
     args = parser.parse_args()
 
     trajectory = _required(args.trajectory, "--trajectory")
     patch_output = _required(args.patch_output, "--patch-output")
     model = _model(args.model)
     instance = load_instance(args.instance_id)
+    verification_command = instance.test_cmd.replace("{python}", "python")
+    agent_task = (
+        f"{instance.problem_statement.rstrip()}\n\n"
+        "<verification_hint>\n"
+        "After making the source change, run this focused repository test command:\n"
+        f"{verification_command}\n"
+        "</verification_hint>"
+    )
 
     print(
         f"Instance: {instance.instance_id} ({instance.repo} @ {instance.base_commit[:12]})"
     )
     print(f"Image: {instance.image}", flush=True)
 
+    environment_kwargs = {"deployment_timeout": args.sandbox_timeout}
     if args.backend == "docker":
         environment_class = LocalDockerEnvironment
-        environment_kwargs = {
-            "platform": args.docker_platform,
-            "docker_args": ["--network", "none"],
-        }
+        environment_kwargs.update(
+            {
+                "platform": args.docker_platform,
+                "docker_args": ["--network", "none"],
+            }
+        )
     else:
         environment_class = Environment
-        environment_kwargs = {}
 
     submitted_patch = ""
     # SWE-bench images install the repository into a conda env named `testbed`
@@ -225,7 +262,7 @@ def run_swebench_agent() -> None:
         **environment_kwargs,
     ) as environment:
         agent = CodeAgent(
-            task=instance.problem_statement,
+            task=agent_task,
             environment=environment,
             model=model,
             logs_save_path=str(trajectory),
@@ -234,13 +271,13 @@ def run_swebench_agent() -> None:
             compact_threshold_tokens=args.compact_threshold_tokens,
             compaction_keep_recent_steps=args.compaction_keep_recent_steps,
             compaction_max_tokens=args.compaction_max_tokens,
+            discovery_inspection_limit=args.discovery_inspection_limit,
+            phase_inspection_limit=args.phase_inspection_limit,
+            tool_interface=args.tool_interface,
             skills_path=str(args.skills_path) if args.skills_path else None,
         )
         agent.run()
-        output = environment.execute("cat patch.txt")
-        if output["returncode"] != 0:
-            raise SystemExit("Error reading agent-produced patch")
-        submitted_patch = output["output"]
+        submitted_patch = agent.submitted_patch
 
     if not submitted_patch.strip():
         raise SystemExit("Agent finished without a non-empty patch.")

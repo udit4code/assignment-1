@@ -1,5 +1,149 @@
 """Tool definitions exposed to the model, in the OpenAI tool-calling format."""
 
+INSPECT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "inspect",
+        "description": (
+            "Perform one read-only repository inspection. Use list_files to list "
+            "files, read_file to read a numbered bounded line range, search to find text, "
+            "or git_diff to inspect current changes. Inspection calls are quota "
+            "limited by the harness."
+        ),
+        "strict": False,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["list_files", "read_file", "search", "git_diff"],
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Repository-relative file or directory; defaults to .",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Literal text to find; required for search",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "First line for read_file; defaults to 1",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Last line for read_file; defaults to start_line + 199",
+                },
+            },
+            "required": ["operation"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+APPLY_PATCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "apply_patch",
+        "description": (
+            "Make one exact, repository-relative text edit. For an existing file, "
+            "old_text must occur exactly once and is replaced by new_text. To create "
+            "a file, use an empty old_text and a non-empty new_text. The harness "
+            "stages the result, confirms the Git change, and requires verification."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Repository-relative file path",
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Exact text to replace; empty only when creating a file",
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text, or complete contents for a new file",
+                },
+            },
+            "required": ["path", "old_text", "new_text"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+RUN_TESTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_tests",
+        "description": (
+            "Run one focused reproduction, test, type check, or build command. "
+            "Pass an argv list; the command is not interpreted by a shell. A passing "
+            "result advances to submission only after a confirmed code change."
+        ),
+        "strict": False,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional repository-relative working directory",
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+                "timeout": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                },
+            },
+            "required": ["argv"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+SUBMIT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit",
+        "description": (
+            "Submit the verified solution. The harness confirms that the latest "
+            "code revision passed, generates the git patch, and ends the run."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Concise summary of changes and verification",
+                }
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+CODE_CAPABILITY_TOOLS = [
+    INSPECT_TOOL,
+    APPLY_PATCH_TOOL,
+    RUN_TESTS_TOOL,
+    SUBMIT_TOOL,
+]
+
 EXECUTE_TOOL = {
     "type": "function",
     "function": {
