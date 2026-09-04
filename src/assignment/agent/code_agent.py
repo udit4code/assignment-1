@@ -44,8 +44,14 @@ class CodeAgent(Agent):
         )
         self.task = task
         self.submitted_patch = ""
+        self.invoked_skills: set[str] = set()
 
         self.tools.extend([EXECUTE_TOOL, SEND_MESSAGE_TOOL])
+        # Small Ollama models are prone to printing a proposed tool call as
+        # prose. A coding turn without an action cannot change or inspect the
+        # sandbox, so require structured calls for the local provider.
+        if self.api_style == "ollama":
+            self.tool_choice = "required"
 
         system_information = json.dumps(
             {
@@ -202,10 +208,35 @@ class CodeAgent(Agent):
                         call_id,
                         tool_error("send_message requires exactly one string summary."),
                     )
-                else:
-                    summary = arguments["summary"]
-                    self.finished = True
-                    add_observation(call_id, summary)
+                    continue
+
+                # A trajectory is saved even when a run fails, but downstream
+                # evaluation needs the separate patch artifact. Prevent a model
+                # from declaring success before following the submission skill.
+                if "submit-task" in self.skills:
+                    if "submit-task" not in self.invoked_skills:
+                        add_observation(
+                            call_id,
+                            tool_error(
+                                "Submission is incomplete. Invoke the "
+                                "submit-task skill before sending the summary."
+                            ),
+                        )
+                        continue
+                    patch_check = self.env.execute("test -s patch.txt")
+                    if patch_check["returncode"] != 0:
+                        add_observation(
+                            call_id,
+                            tool_error(
+                                "Submission is incomplete. Follow the submit-task "
+                                "skill and create a non-empty patch.txt first."
+                            ),
+                        )
+                        continue
+
+                summary = arguments["summary"]
+                self.finished = True
+                add_observation(call_id, summary)
 
             elif name == "invoke_skill" and self.skills:
                 if set(arguments) != {"name"} or not isinstance(
@@ -221,6 +252,7 @@ class CodeAgent(Agent):
                         tool_error(f"Unknown skill: {arguments['name']}."),
                     )
                 else:
+                    self.invoked_skills.add(arguments["name"])
                     add_observation(
                         call_id,
                         self.skills[arguments["name"]]["content"],

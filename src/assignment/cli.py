@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from assignment.agent import (
+    CalculatorAgent,
     ChessAgent,
     CodeAgent,
 )
@@ -99,6 +100,33 @@ def _model(argument: str | None) -> str:
     if not model:
         raise SystemExit("Set OPENAI_MODEL or pass --model.")
     return model
+
+
+def run_calculator_agent() -> None:
+    """Solve a small arithmetic question with the shared agent loop."""
+
+    parser = argparse.ArgumentParser(description=run_calculator_agent.__doc__)
+    parser.add_argument(
+        "question",
+        help='arithmetic question, e.g. "What is (17 + 5) * 3?"',
+    )
+    parser.add_argument("--model")
+    parser.add_argument("--step-limit", type=int, default=8)
+    parser.add_argument(
+        "--trajectory",
+        type=Path,
+        help="optional path for the prompts and responses",
+    )
+    args = parser.parse_args()
+
+    agent = CalculatorAgent(
+        question=args.question,
+        model=_model(args.model),
+        logs_save_path=str(args.trajectory) if args.trajectory else None,
+        step_limit=args.step_limit,
+    )
+    agent.run()
+    print(f"Answer: {agent.final_answer}")
 
 
 def run_code_agent() -> None:

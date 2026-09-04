@@ -1,4 +1,5 @@
 .PHONY: setup doctor verify-sources test test-modal test-chess-modal check-part1 check-swebench \
+	run-calculator-agent-local \
 	run-code-agent run-swebench-agent run-chess-agent \
 	doctor-local run-code-agent-local check-part1-local run-swebench-agent-local \
 	check-swebench-local run-chess-agent-local run-chess-agent-local-skill \
@@ -30,13 +31,20 @@ OBS_NO_LEGAL_TRAJECTORY ?= artifacts/part3-no-legal-moves-$(MODEL_TAG).json
 OBS_LEGAL_TRAJECTORY ?= artifacts/part3-legal-moves-$(MODEL_TAG).json
 OBS_NO_LEGAL_RESULT ?= artifacts/part3-no-legal-moves-$(MODEL_TAG)-result.json
 OBS_LEGAL_RESULT ?= artifacts/part3-legal-moves-$(MODEL_TAG)-result.json
-LOCAL_MODEL ?= qwen3:8b
+LOCAL_MODEL ?= qwen3:4b-thinking
 OLLAMA_BASE_URL ?= http://127.0.0.1:11434/v1
 OLLAMA_API_KEY ?= ollama
+# Keep local runs independent of Docker Desktop settings. The project config
+# contains no credentials; public images are pulled anonymously from Colima.
+LOCAL_DOCKER_CONFIG ?= $(CURDIR)/.docker-local
+COLIMA_DOCKER_HOST ?= unix://$(HOME)/.colima/default/docker.sock
+LOCAL_DOCKER_ENV = DOCKER_CONFIG="$(LOCAL_DOCKER_CONFIG)" DOCKER_HOST="$(COLIMA_DOCKER_HOST)"
 LOCAL_PATCH ?= artifacts/local-fix.patch
 LOCAL_PART1_TRAJECTORY ?= artifacts/local-part1-trajectory.json
 LOCAL_TRAJECTORY ?= artifacts/local-part3-trajectory.json
 LOCAL_RESULT ?= artifacts/local-game-result.json
+CALCULATION ?= What is (17 + 5) * 3?
+CALCULATOR_TRAJECTORY ?= artifacts/calculator-trajectory.json
 
 setup:
 	uv sync
@@ -47,9 +55,17 @@ doctor:
 	uv run assignment-doctor
 
 doctor-local:
+	$(LOCAL_DOCKER_ENV) \
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-doctor --backend docker
+
+# Smallest end-to-end ReAct example: Ollama only, with no Modal/Colima sandbox.
+run-calculator-agent-local:
+	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
+	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama \
+	uv run assignment-calculator "$(CALCULATION)" --model "$(LOCAL_MODEL)" \
+		--trajectory $(CALCULATOR_TRAJECTORY)
 
 verify-sources:
 	uv run python -c "from assignment.task import Task; from assignment.utils.image import verify_source; verify_source(Task.load('tasks/chess-terminal-move'))"
@@ -81,12 +97,12 @@ check-swebench:
 
 check-part1-local:
 	@test -f "$(LOCAL_PATCH)" || (echo "Patch not found: $(LOCAL_PATCH). Run make run-code-agent-local first."; exit 1)
-	uv run python scripts/evaluate.py --backend docker --task $(TASK) \
+	$(LOCAL_DOCKER_ENV) uv run python scripts/evaluate.py --backend docker --task $(TASK) \
 		--evaluation $(PUBLIC_EVAL) --patch $(LOCAL_PATCH) -v
 
 check-swebench-local:
 	@test -f "$(SWEBENCH_PATCH)" || (echo "Patch not found: $(SWEBENCH_PATCH)."; exit 1)
-	uv run python scripts/evaluate_swebench.py --backend docker $(INSTANCE) \
+	$(LOCAL_DOCKER_ENV) uv run python scripts/evaluate_swebench.py --backend docker $(INSTANCE) \
 		--patch $(SWEBENCH_PATCH) -v
 
 run-code-agent:
@@ -95,6 +111,7 @@ run-code-agent:
 		--patch-output $(PATCH)
 
 run-code-agent-local:
+	$(LOCAL_DOCKER_ENV) \
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-code-agent --backend docker --task $(TASK) --model "$(LOCAL_MODEL)" \
@@ -110,6 +127,7 @@ run-swebench-agent:
 		--step-limit $(STEPS) $(if $(filter-out 0,$(COMPACT_THRESHOLD)),--compact-threshold-tokens $(COMPACT_THRESHOLD),)
 
 run-swebench-agent-local:
+	$(LOCAL_DOCKER_ENV) \
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-swebench-agent --backend docker $(INSTANCE) --model "$(LOCAL_MODEL)" \
@@ -123,6 +141,7 @@ run-chess-agent:
 		--trajectory $(TRAJECTORY) --result $(RESULT)
 
 run-chess-agent-local:
+	$(LOCAL_DOCKER_ENV) \
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-play-chess --backend docker --model "$(LOCAL_MODEL)" \
@@ -131,6 +150,7 @@ run-chess-agent-local:
 		--result $(LOCAL_RESULT)
 
 run-chess-agent-local-skill:
+	$(LOCAL_DOCKER_ENV) \
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
 	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-play-chess --backend docker --programmatic-tools \

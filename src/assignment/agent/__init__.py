@@ -13,12 +13,14 @@ from assignment.agent.base import (
     format_tool_output,
     rough_message_tokens,
 )
+from assignment.agent.calculator_agent import CalculatorAgent
 from assignment.agent.chess_agent import ChessAgent, format_chess_state
 from assignment.agent.code_agent import CodeAgent
 
 __all__ = [
     "MAX_OBSERVATION_CHARS",
     "Agent",
+    "CalculatorAgent",
     "ChessAgent",
     "CodeAgent",
     "StepLimitError",

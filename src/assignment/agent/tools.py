@@ -130,6 +130,55 @@ INVOKE_SKILL_TOOL = {
     },
 }
 
+# The calculator intentionally exposes a small, structured operation instead
+# of accepting Python source or an expression for eval(). This keeps the demo
+# safe and makes each model action/observation easy to follow in a trajectory.
+CALCULATE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": (
+            "Perform one binary arithmetic operation. Chain multiple calls by "
+            "using a previous result as the left or right operand."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["add", "subtract", "multiply", "divide"],
+                    "description": "The arithmetic operation to perform.",
+                },
+                "left": {"type": "number", "description": "The left operand."},
+                "right": {"type": "number", "description": "The right operand."},
+            },
+            "required": ["operation", "left", "right"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+SUBMIT_ANSWER_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "submit_answer",
+        "description": "Return the final answer and finish the calculator task.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string",
+                    "description": "The final answer, including units when relevant.",
+                }
+            },
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 PLAY_MOVE_TOOL: dict = {
     "type": "function",
     "function": {

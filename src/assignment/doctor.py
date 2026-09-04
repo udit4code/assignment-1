@@ -100,7 +100,11 @@ def main() -> int:
                     context_name = context.stdout.strip() if context.returncode == 0 else ""
                 except (OSError, subprocess.TimeoutExpired):
                     context_name = ""
-                print(f"[ok] Docker backend: {context_name or 'active context'}")
+                docker_endpoint = os.environ.get("DOCKER_HOST")
+                print(
+                    "[ok] Docker backend: "
+                    f"{docker_endpoint or context_name or 'active context'}"
+                )
             else:
                 failures.append(
                     "Docker daemon is unavailable; start Colima with `colima start`: "

@@ -18,6 +18,7 @@ dependencies = [
 dev = ["pytest>=8.0"]
 
 [project.scripts]
+assignment-calculator = "assignment.cli:run_calculator_agent"
 assignment-chess-modal = "assignment.chess_sandbox:main"
 assignment-chess-sandbox = "assignment.chess_sandbox:main"
 assignment-code-agent = "assignment.cli:run_code_agent"

@@ -156,6 +156,9 @@ class Agent:
         self.api_responses: list[dict[str, Any]] = []
         self.compaction_events: list[dict[str, Any]] = []
         self.tools: list[dict[str, Any]] = []
+        # Subclasses may require a structured action on every turn. Most agents
+        # leave this unset so the provider retains its default "auto" behavior.
+        self.tool_choice: str | None = None
         self.finished = False
         self.steps_taken = 0
 
@@ -282,17 +285,21 @@ class Agent:
             flush=True,
         )
         try:
-            token_limit = (
+            request_options = (
                 {"max_tokens": 4096}
                 if self.api_style == "ollama"
-                else {"max_completion_tokens": 4096}
+                else {
+                    "max_completion_tokens": 4096,
+                    "reasoning_effort": "medium",
+                }
             )
+            if self.tool_choice is not None:
+                request_options["tool_choice"] = self.tool_choice
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=self.tools,
-                reasoning_effort="medium",
-                **token_limit,
+                **request_options,
             )
         except Exception as exc:
             print(
@@ -434,16 +441,18 @@ class Agent:
         ]
 
         ### Do not modify this section ###
-        token_limit = (
+        request_options = (
             {"max_tokens": self.compaction_max_tokens}
             if self.api_style == "ollama"
-            else {"max_completion_tokens": self.compaction_max_tokens}
+            else {
+                "max_completion_tokens": self.compaction_max_tokens,
+                "reasoning_effort": "medium",
+            }
         )
         compaction_response = self.client.chat.completions.create(
             model=self.model,
             messages=compaction_prompt,
-            reasoning_effort="medium",
-            **token_limit,
+            **request_options,
         )
 
         compaction_response_dump = compaction_response.model_dump(mode="json")
