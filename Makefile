@@ -152,7 +152,7 @@ run-chess-agent-local:
 run-chess-agent-local-skill:
 	$(LOCAL_DOCKER_ENV) \
 	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
-	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
+	="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
 	uv run assignment-play-chess --backend docker --programmatic-tools \
 		--skills-path tasks/chess-skills --model "$(LOCAL_MODEL)" --task $(TASK) \
 		--patch $(LOCAL_PATCH) --step-limit $(STEPS) --sandbox-timeout $(CHESS_TIMEOUT) \
