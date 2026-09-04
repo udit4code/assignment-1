@@ -45,14 +45,39 @@ def _simulate_move(client: httpx.Client, arguments: str) -> str:
     to send back, so a bad argument or a server error reaches the model as a
     recoverable ``<chess_error>`` instead of ending the run.
     """
-    # TODO(Part 3.3.b): Parse the arguments, call the provided
-    # /api/simulate endpoint with fen and optional move, and return its JSON.
-    # Catch any errors raised by the tool and return an error message between
-    # `<chess_error></chess_error>` for the agent to address. Cover malformed
-    # JSON arguments, arguments that are not an object, a missing or
-    # non-string fen, a non-string move, a position or move the server rejects,
-    # and a transport failure.
-    raise NotImplementedError
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("simulate_move arguments must be a JSON object")
+
+        extra = set(parsed) - {"fen", "move"}
+        if extra:
+            names = ", ".join(sorted(extra))
+            raise ValueError(f"Unknown simulate_move argument(s): {names}")
+
+        fen = parsed.get("fen")
+        if not isinstance(fen, str) or not fen.strip():
+            raise ValueError("fen must be a non-empty string")
+
+        move = parsed.get("move")
+        if move is not None and (
+            not isinstance(move, str) or not move.strip()
+        ):
+            raise ValueError("move must be a non-empty UCI string or null")
+
+        payload: dict[str, str | None] = {"fen": fen}
+        if "move" in parsed:
+            payload["move"] = move
+
+        state = _request_state(
+            client,
+            "POST",
+            "/api/simulate",
+            json=payload,
+        )
+        return json.dumps(state)
+    except Exception as exc:
+        return f"<chess_error>{type(exc).__name__}: {exc}</chess_error>"
 
 
 def _play_move(client: httpx.Client, arguments: str) -> str:

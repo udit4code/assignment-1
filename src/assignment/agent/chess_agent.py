@@ -109,7 +109,7 @@ class ChessAgent(Agent):
         self.tools.append(PLAY_MOVE_TOOL)
 
         if programmatic_tools:
-            self.tools.append(RUN_PYTHON_TOOL)
+            self.tools.extend([SIMULATE_MOVE_TOOL, RUN_PYTHON_TOOL])
 
         # run_python always executes in the sandbox, on the port the chess
         # server is listening on there.
@@ -203,6 +203,13 @@ class ChessAgent(Agent):
                 add_observation(
                     call_id,
                     chess_error("Tool arguments must be a JSON string."),
+                )
+                continue
+
+            if name == "simulate_move":
+                add_observation(
+                    call_id,
+                    _simulate_move(self.chess_client, arguments),
                 )
                 continue
 
