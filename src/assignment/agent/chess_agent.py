@@ -106,7 +106,7 @@ class ChessAgent(Agent):
             compaction_max_tokens=compaction_max_tokens,
         )
 
-        # TODO(Part 3): Register the play_move tool schema from tools.py.
+        self.tools.append(PLAY_MOVE_TOOL)
 
         if programmatic_tools:
             self.tools.append(RUN_PYTHON_TOOL)
@@ -163,18 +163,83 @@ class ChessAgent(Agent):
     ) -> list[dict[str, str]]:
         """Execute model-generated ``play_move`` calls against the chess API."""
 
-        # TODO(Part 3.1):
-        # 1. Dispatch on the function name, and ignore a tool this agent did
-        #    not register.
-        # 2. Hand the raw arguments to the matching chess_tools helper, with
-        #    self.chess_client as its first argument. Each helper takes the
-        #    client explicitly so the same code can run inside the sandbox.
-        # 3. Format a played move with self.format_state, then update
-        #    last_state and finished.
-        # 4. Link every observation to its call with tool_call_id.
-        # 5. Turn malformed, unknown, rejected, or extra parallel calls into
-        #    recoverable <chess_error> observations instead of crashing.
+        observations: list[dict[str, str]] = []
+        registered_names = {
+            tool.get("function", {}).get("name")
+            for tool in self.tools
+            if isinstance(tool, dict)
+        }
+        play_move_seen = False
 
-        # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
-        # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+        def add_observation(call_id: str, content: str) -> None:
+            observations.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                }
+            )
+
+        def chess_error(message: str) -> str:
+            return f"<chess_error>{message}</chess_error>"
+
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                add_observation("unknown", chess_error("Malformed tool call."))
+                continue
+
+            call_id = str(call.get("id", "unknown"))
+            function = call.get("function")
+            if not isinstance(function, dict):
+                add_observation(call_id, chess_error("Malformed tool call."))
+                continue
+
+            name = function.get("name")
+            arguments = function.get("arguments")
+            if not isinstance(name, str) or name not in registered_names:
+                add_observation(call_id, chess_error(f"Unknown tool: {name}."))
+                continue
+            if not isinstance(arguments, str):
+                add_observation(
+                    call_id,
+                    chess_error("Tool arguments must be a JSON string."),
+                )
+                continue
+
+            if name != "play_move":
+                add_observation(
+                    call_id,
+                    chess_error(f"Tool is not implemented yet: {name}."),
+                )
+                continue
+            if play_move_seen:
+                add_observation(
+                    call_id,
+                    chess_error(
+                        "Only one play_move call can be executed per model response."
+                    ),
+                )
+                continue
+
+            play_move_seen = True
+            result = _play_move(self.chess_client, arguments)
+            if result.startswith("<chess_error>"):
+                add_observation(call_id, result)
+                continue
+
+            try:
+                state = json.loads(result)
+                if not isinstance(state, dict):
+                    raise ValueError("move response was not a JSON object")
+            except (json.JSONDecodeError, ValueError) as exc:
+                add_observation(
+                    call_id,
+                    chess_error(f"Invalid move response: {exc}"),
+                )
+                continue
+
+            self.last_state = state
+            self.finished = bool(state.get("game_over"))
+            add_observation(call_id, self.format_state(state))
+
+        return observations

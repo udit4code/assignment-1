@@ -61,13 +61,26 @@ def _play_move(client: httpx.Client, arguments: str) -> str:
     Takes the raw JSON arguments of one tool call. Returns the new state, or a
     `<chess_error>` observation if the move could not be played.
     """
-    # TODO(3.1.b): Parse the arguments and POST {"move": <uci move>} to
-    # /api/move. Return its JSON object. Catch any errors raised by the
-    # tool and return an error message between `<chess_error></chess_error>`
-    # for the agent to address. Cover malformed JSON arguments, arguments
-    # that are not an object, a missing or non-string fen, a non-string move,
-    # a position or move the server rejects, and a transport failure.
-    raise NotImplementedError
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("play_move arguments must be a JSON object")
+        if set(parsed) != {"move"}:
+            raise ValueError("play_move requires exactly one argument named move")
+
+        move = parsed["move"]
+        if not isinstance(move, str) or not move.strip():
+            raise ValueError("move must be a non-empty string in UCI notation")
+
+        state = _request_state(
+            client,
+            "POST",
+            "/api/move",
+            json={"move": move},
+        )
+        return json.dumps(state)
+    except Exception as exc:
+        return f"<chess_error>{type(exc).__name__}: {exc}</chess_error>"
 
 
 def _run_python(env: Any, port: int, arguments: str) -> str:
