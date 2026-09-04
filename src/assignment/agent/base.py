@@ -39,9 +39,11 @@ and their outcomes; current blockers; and the next intended action. Clearly
 distinguish facts supplied by the task from facts verified through tool output.
 Never say that code was changed, a reproduction was run, or tests passed unless
 a tool observation confirms it. Record repeated or no-progress actions and make
-the next intended action materially different from them. Do not copy large raw
-outputs, invent facts, or include conversational filler. Return only the
-working-memory summary."""
+the next intended action materially different from them. Never recommend Git
+staging or history mutations such as git add, commit, reset, restore, checkout,
+switch, stash, or clean; coding-agent changes must remain as uncommitted working-
+tree changes for patch submission. Do not copy large raw outputs, invent facts,
+or include conversational filler. Return only the working-memory summary."""
 
 
 class StepLimitError(Exception):

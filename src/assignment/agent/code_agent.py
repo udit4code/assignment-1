@@ -83,9 +83,20 @@ class CodeAgent(Agent):
     _MUTATION_PATTERN = re.compile(
         r"^(?:"
         r"apply_patch|patch|tee|touch|mkdir|rm|mv|cp|install|chmod|chown|"
-        r"git\s+(?:apply|add|rm|mv|checkout|restore|reset|commit)|"
+        r"git\s+apply|"
         r"(?:npm|pnpm|yarn|pip|uv|poetry|cargo)\s+(?:add|install|remove)"
         r")(?:\s|$)"
+    )
+    _FORBIDDEN_GIT_PATTERN = re.compile(
+        r"(?:^|[;&|()\n]\s*)"
+        r"(?:(?:command|sudo)\s+)?(?:env\s+)?"
+        r"(?:[a-z_]\w*=\S+\s+)*git\s+"
+        r"(?:(?:-[Cc]\s+\S+|"
+        r"--(?:git-dir|work-tree)(?:=\S+|\s+\S+)|"
+        r"--(?:no-pager|bare|literal-pathspecs|no-optional-locks))\s+)*"
+        r"(?:add|commit|reset|restore|checkout|switch|stash|clean|rm|mv|am|"
+        r"merge|rebase|cherry-pick)(?=\s|$|[;&|)])",
+        re.IGNORECASE,
     )
 
     def __init__(
@@ -148,6 +159,10 @@ class CodeAgent(Agent):
         self.change_digest: str | None = None
         self.verified_digest: str | None = None
         self.applied_paths: set[str] = set()
+        self.initial_revision: str | None = None
+        self.initial_revision_checked = False
+        self.worktree_diff_digest: str | None = None
+        self.worktree_diff_status = "unknown"
         self.exposed_skills = dict(self.skills)
         if tool_interface == "capability":
             # The harness-owned submit capability supersedes the legacy
@@ -191,8 +206,13 @@ class CodeAgent(Agent):
             "Never claim that an edit was made or a test passed unless a tool "
             "observation confirms it. Follow the phase shown in every "
             "<agent_state> observation. Rejected phase-gate calls do not run, "
-            "so follow their next_action instead of retrying them. This run has "
-            f"a hard budget of {step_limit} action steps. Reserve enough steps "
+            "so follow their next_action instead of retrying them. "
+            "Never stage or commit repository changes. Do not run git add, git "
+            "commit, git reset, git restore, git checkout, git switch, git "
+            "stash, git clean, or other Git history-changing commands. Keep "
+            "source edits as uncommitted working-tree changes so submission can "
+            "capture them. "
+            f"This run has a hard budget of {step_limit} action steps. Reserve enough steps "
             "for implementation, verification, and submission."
         )
         if tool_interface == "capability":
@@ -240,6 +260,12 @@ class CodeAgent(Agent):
         if isinstance(command, str):
             return command.strip()
         return " ".join(command).strip()
+
+    @classmethod
+    def _contains_forbidden_git_action(cls, command: str | list[str]) -> bool:
+        """Reject model-issued Git operations that can hide or destroy a patch."""
+
+        return cls._FORBIDDEN_GIT_PATTERN.search(cls._command_text(command)) is not None
 
     @classmethod
     def _classify_command(cls, command: str | list[str]) -> ExecuteKind:
@@ -324,6 +350,7 @@ class CodeAgent(Agent):
     def _agent_state(self) -> str:
         """Expose compact deterministic state to the next model turn."""
 
+        initial_revision = self.initial_revision or "unknown"
         interface_state = (
             f'applied_paths="{len(self.applied_paths)}"'
             if self.tool_interface == "capability"
@@ -342,14 +369,24 @@ class CodeAgent(Agent):
             f'verification_status="{self.verification_status}" '
             f'change_revision="{self.change_revision}" '
             f'verified_revision="{self.verified_revision}" '
+            f'initial_revision="{initial_revision}" '
+            f'worktree_diff="{self.worktree_diff_status}" '
             f"{interface_state}>"
             f"<next_action>{self._next_action()}</next_action>"
             "</agent_state>"
         )
 
     @staticmethod
-    def _working_tree_changed(status_result: dict[str, Any]) -> bool:
+    def _working_tree_changed(
+        status_result: dict[str, Any],
+        diff_result: dict[str, Any] | None = None,
+    ) -> bool:
         """Return whether git objectively reports a non-submission change."""
+
+        if diff_result is not None and diff_result.get("returncode") == 0:
+            diff_output = diff_result.get("output", "")
+            if isinstance(diff_output, str) and diff_output.strip():
+                return True
 
         if status_result.get("returncode") != 0:
             return False
@@ -362,6 +399,63 @@ class CodeAgent(Agent):
             if path and path != "patch.txt":
                 return True
         return False
+
+    def _ensure_initial_revision(self) -> None:
+        """Capture the immutable comparison point before the first shell action."""
+
+        if self.initial_revision_checked:
+            return
+        self.initial_revision_checked = True
+        result = self.env.execute("git rev-parse HEAD")
+        output = result.get("output", "")
+        if result.get("returncode") == 0 and isinstance(output, str):
+            revision = output.strip().splitlines()[0] if output.strip() else ""
+            if re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+                self.initial_revision = revision
+
+    def _baseline_diff(self) -> dict[str, Any]:
+        """Diff all tracked work against the revision where this run started."""
+
+        revision = self.initial_revision or "HEAD"
+        return self.env.execute(
+            f"git diff --binary --no-ext-diff {revision} -- ."
+        )
+
+    def _format_baseline_diff(
+        self,
+        diff_result: dict[str, Any],
+        status_result: dict[str, Any],
+    ) -> str:
+        """Expose bounded proof of worktree progress without repeating the patch."""
+
+        output = diff_result.get("output", "")
+        valid_output = isinstance(output, str)
+        changed = self._working_tree_changed(status_result, diff_result)
+        digest = (
+            hashlib.sha256(output.encode("utf-8")).hexdigest()
+            if changed and valid_output and output.strip()
+            else None
+        )
+        self.worktree_diff_digest = digest
+        self.worktree_diff_status = (
+            "changed"
+            if changed
+            else "clean"
+            if diff_result.get("returncode") == 0
+            else "unavailable"
+        )
+        revision = self.initial_revision or "unknown"
+        byte_count = len(output.encode("utf-8")) if valid_output else 0
+        formatted = (
+            f'<git_diff_against_initial_revision revision="{revision}" '
+            f'returncode="{diff_result.get("returncode", -1)}" '
+            f'changed="{str(changed).lower()}" bytes="{byte_count}" '
+            f'sha256="{digest or ""}"'
+        )
+        exception_info = diff_result.get("exception_info")
+        if exception_info:
+            return f"{formatted}><exception_info>{exception_info}</exception_info></git_diff_against_initial_revision>"
+        return f"{formatted} />"
 
     @staticmethod
     def _format_git_status(status_result: dict[str, Any]) -> str:
@@ -818,6 +912,7 @@ class CodeAgent(Agent):
         command: str | list[str],
         returncode: int,
         status_result: dict[str, Any],
+        diff_result: dict[str, Any],
     ) -> None:
         """Apply state transitions after an admitted command completes."""
 
@@ -827,7 +922,7 @@ class CodeAgent(Agent):
             self.implementation_attempts += 1
             self.patch_created = False
             self.patch_reviewed = False
-            working_tree_changed = self._working_tree_changed(status_result)
+            working_tree_changed = self._working_tree_changed(status_result, diff_result)
             self.verification_status = (
                 "required" if working_tree_changed else "change_not_detected"
             )
@@ -842,7 +937,7 @@ class CodeAgent(Agent):
             self.verification_status = "passed" if returncode == 0 else "failed"
             if (
                 self.has_successful_implementation
-                and self._working_tree_changed(status_result)
+                and self._working_tree_changed(status_result, diff_result)
             ):
                 self._transition(
                     CodeAgentPhase.SUBMIT
@@ -989,6 +1084,17 @@ class CodeAgent(Agent):
                         call_id,
                         tool_error("execute env must map strings to strings or be null."),
                     )
+                elif self._contains_forbidden_git_action(command):
+                    add_observation(
+                        call_id,
+                        tool_error(
+                            "Git staging/history mutation is forbidden. Do not run "
+                            "git add, commit, reset, restore, checkout, switch, "
+                            "stash, clean, rm, mv, merge, rebase, or cherry-pick. "
+                            "Keep source changes uncommitted and continue with "
+                            "verification or submission."
+                        ),
+                    )
                 else:
                     kind = self._classify_command(command)
                     gate_error = self._admit_command(kind)
@@ -1011,6 +1117,7 @@ class CodeAgent(Agent):
                     )
                     call_count = self.execute_call_counts.get(call_signature, 0) + 1
                     self.execute_call_counts[call_signature] = call_count
+                    self._ensure_initial_revision()
                     result = self.env.execute(
                         command,
                         shell=shell,
@@ -1018,16 +1125,19 @@ class CodeAgent(Agent):
                         timeout=timeout,
                         env=env,
                     )
+                    diff_result = self._baseline_diff()
                     status_result = self.env.execute("git status --porcelain")
                     self._record_command_result(
                         kind,
                         command,
                         int(result["returncode"]),
                         status_result,
+                        diff_result,
                     )
                     observation = (
                         f"{format_tool_output(result)}\n"
-                        f"{self._format_git_status(status_result)}"
+                        f"{self._format_git_status(status_result)}\n"
+                        f"{self._format_baseline_diff(diff_result, status_result)}"
                     )
                     if call_count > 1:
                         observation += (

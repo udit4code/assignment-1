@@ -24,6 +24,7 @@ PATCH = """diff --git a/django/db/models/query.py b/django/db/models/query.py
 -old
 +new
 """
+BASELINE_REVISION = "1" * 40
 
 
 class FakeEnvironment:
@@ -49,7 +50,13 @@ class FakeEnvironment:
                 "output": "M  django/db/models/query.py\n" if self.dirty else "",
                 "returncode": 0,
             }
+        if command == "git rev-parse HEAD":
+            return {"output": f"{BASELINE_REVISION}\n", "returncode": 0}
         if isinstance(command, list) and command[:3] == ["git", "diff", "--cached"]:
+            return {"output": PATCH if self.dirty else "", "returncode": 0}
+        if isinstance(command, list) and command[:2] == ["git", "diff"]:
+            return {"output": PATCH if self.dirty else "", "returncode": 0}
+        if isinstance(command, str) and command.startswith("git diff --binary"):
             return {"output": PATCH if self.dirty else "", "returncode": 0}
         return {"output": "", "returncode": 0}
 
@@ -108,6 +115,9 @@ def main() -> None:
     default_tools = {tool["function"]["name"] for tool in default_agent.tools}
     assert {"execute", "send_message"} <= default_tools
     assert "apply_patch" not in default_tools
+    assert CodeAgent._contains_forbidden_git_action("git -c user.name=x commit -m x")
+    assert CodeAgent._contains_forbidden_git_action("echo ok && git reset --hard")
+    assert not CodeAgent._contains_forbidden_git_action("rg 'git commit' docs")
 
     legacy_environment = FakeEnvironment()
     legacy_agent = CodeAgent(
@@ -116,13 +126,25 @@ def main() -> None:
         model="gpt-5-mini",
         skills_path="tasks/code-skills",
     )
-    call(
+    commands_before = list(legacy_environment.commands)
+    rejected_commit = call(
+        legacy_agent,
+        "legacy-commit",
+        "execute",
+        {"command": "git add -A && git commit -m 'hide the patch'"},
+    )
+    assert "Git staging/history mutation is forbidden" in rejected_commit
+    assert legacy_environment.commands == commands_before
+
+    edit_observation = call(
         legacy_agent,
         "legacy-edit",
         "execute",
         {"command": "python -c 'edit'"},
     )
     assert legacy_agent.phase == CodeAgentPhase.VERIFY
+    assert legacy_agent.initial_revision == BASELINE_REVISION
+    assert 'changed="true"' in edit_observation
     call(
         legacy_agent,
         "legacy-test",
@@ -151,6 +173,7 @@ def main() -> None:
     )
     assert legacy_agent.finished
     assert legacy_agent.submitted_patch == PATCH
+    assert legacy_agent.worktree_diff_digest is not None
 
     environment = FakeEnvironment()
     agent = CodeAgent(
