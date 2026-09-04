@@ -20,26 +20,97 @@ That ordinary program is the **agent harness**.
 The main pieces are:
 
 ```text
-User's task
-    |
-    v
-Agent harness ---> Language model
-    |                    |
-    |                    | proposes an action
-    |                    v
-    +------------ Tool call
-    |
-    | executes the tool
-    v
-Environment
-    |
-    | returns an observation
-    v
-Agent harness ---> Language model again
+  (1) USER
+      "What is 27 + 15?"
+              |
+              v
+  (2) AGENT HARNESS
+      Builds a prompt containing:
+      - the user's task;
+      - conversation history;
+      - available tool schemas.
+              |
+              v
+  (3) LANGUAGE MODEL
+      Chooses the next response. It may return a structured tool call:
+
+      tool: addition_operation
+      arguments: {"a": 27, "b": 15}
+              |
+              v
+  (4) AGENT HARNESS
+      - parses the structured call;
+      - checks that the tool and arguments are valid;
+      - dispatches the call to the registered implementation.
+              |
+              v
+  (5) TOOL / ENVIRONMENT
+      Runs the real function: addition_operation(a=27, b=15)
+      Produces the real result: 42
+              |
+              v
+  (6) AGENT HARNESS
+      Adds a structured tool-result message to the history:
+
+      tool result: 42
+              |
+              v
+  (7) LANGUAGE MODEL
+      Receives the updated history and answers:
+      "27 + 15 = 42."
+```
+
+The cycle can also be shown more compactly:
+
+```text
+User
+  |
+  | task
+  v
+Harness ---- prompt + tool schemas ----> Language model
+   ^                                      |
+   |                                      | structured tool call
+   |                                      v
+   +---- structured observation ---- Tool dispatcher
+                                          |
+                                          | validated function call
+                                          v
+                                    Tool / environment
 ```
 
 The language model decides what it would like to do. The harness controls what
-it is actually allowed to do.
+it is actually allowed to do and performs the real operation.
+
+### A crucial distinction: prose is not a tool call
+
+Suppose the model produces only ordinary text:
+
+```text
+I should invoke the addition operation with 27 and 15.
+```
+
+The harness should normally treat that as text. It should **not** guess that it
+must execute a function. Guessing executable intent from prose would be
+ambiguous and unsafe.
+
+To request execution, the model should return the structured form required by
+the API, conceptually:
+
+```json
+{
+  "id": "call_1",
+  "type": "function",
+  "function": {
+    "name": "addition_operation",
+    "arguments": "{\"a\": 27, \"b\": 15}"
+  }
+}
+```
+
+The model chooses `addition_operation` and supplies its proposed arguments
+because the harness previously showed the model that tool's schema. The
+harness then parses and validates the proposal, finds the corresponding real
+function, executes it, and returns the result as a structured observation.
 
 ## 2. Model, agent, harness, tool, and environment
 
