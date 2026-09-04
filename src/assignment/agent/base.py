@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_COMPACTION_KEEP_RECENT_STEPS = 1
 DEFAULT_COMPACTION_MAX_TOKENS = 1_200
+MAX_COMPACTION_ATTEMPTS = 3
 MAX_OBSERVATION_CHARS = 10_000
 
 COMPACTION_SYSTEM_PROMPT = """You create concise, factual working memory for a
@@ -40,6 +41,10 @@ the working-memory summary."""
 
 class StepLimitError(Exception):
     """Raised when an agent exhausts its model-call budget."""
+
+
+class EmptyCompactionSummaryError(RuntimeError):
+    """Raised when a successful compaction request has no summary text."""
 
 
 def format_tool_output(output: dict[str, Any]) -> str:
@@ -460,7 +465,9 @@ class Agent:
 
         summary = compaction_response.choices[0].message.content
         if not isinstance(summary, str) or not summary.strip():
-            raise RuntimeError("Compaction model returned an empty summary.")
+            raise EmptyCompactionSummaryError(
+                "Compaction model returned an empty summary."
+            )
 
         self.conversation_history = [
             {
@@ -492,7 +499,18 @@ class Agent:
         ):
             return False
 
-        compaction_prompt, compaction_response = self.compact_context()
+        for attempt in range(1, MAX_COMPACTION_ATTEMPTS + 1):
+            try:
+                compaction_prompt, compaction_response = self.compact_context()
+                break
+            except EmptyCompactionSummaryError:
+                if attempt == MAX_COMPACTION_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Compaction returned an empty summary; retrying (%d/%d).",
+                    attempt + 1,
+                    MAX_COMPACTION_ATTEMPTS,
+                )
         prompt_after = deepcopy(self.build_prompt())
         self.compaction_events.append(
             {
