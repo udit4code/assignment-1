@@ -13,6 +13,7 @@ and issue text are vendored under `tasks/swebench/`.
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,15 @@ def main() -> int:
     parser.add_argument(
         "--timeout", type=float, default=1800, help="Seconds allowed for the test command"
     )
+    parser.add_argument(
+        "--backend",
+        choices=("modal", "docker"),
+        default=os.environ.get("ASSIGNMENT_BACKEND", "modal"),
+    )
+    parser.add_argument(
+        "--docker-platform",
+        default=os.environ.get("DOCKER_DEFAULT_PLATFORM"),
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Log each evaluation step")
     args = parser.parse_args()
 
@@ -41,7 +51,13 @@ def main() -> int:
 
     print(patch)
 
-    report = evaluate(instance, patch=patch, timeout=args.timeout)
+    report = evaluate(
+        instance,
+        patch=patch,
+        timeout=args.timeout,
+        backend=args.backend,
+        docker_platform=args.docker_platform,
+    )
     print(report.summary())
     return 0 if report.resolved else 1
 

@@ -14,7 +14,11 @@ already-fixed working tree would make a broken agent look like it passed.
 from __future__ import annotations
 
 import logging
+import re
+import shlex
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import modal
@@ -61,6 +65,17 @@ def verify_source(task: Task, strict: bool = True) -> None:
         raise SourceMismatch(
             f"{task.source} does not exist. If it is a submodule, run `git submodule update --init`."
         )
+
+    top_level = _git(task.source, "rev-parse", "--show-toplevel")
+    if (
+        top_level.returncode != 0
+        or Path(top_level.stdout.strip()).resolve() != task.source.resolve()
+    ):
+        complain(
+            f"{task.source} is not an initialized git checkout. "
+            "Run `git submodule update --init`."
+        )
+        return
 
     head = _git(task.source, "rev-parse", "HEAD")
     if head.returncode != 0:
@@ -116,3 +131,91 @@ def build_testbed_image(task: Task, strict: bool = True, force_build: bool = Fal
         image = image.pip_install(*task.pins)
 
     return image
+
+
+def build_local_testbed_image(
+    task: Task,
+    strict: bool = True,
+    force_build: bool = False,
+    container_runtime: str = "docker",
+    platform: str | None = None,
+) -> str:
+    """Build the task testbed with the active local Docker-compatible runtime.
+
+    The temporary build context applies the same exclusions as the Modal image
+    builder, and a derived layer installs the task's dependency pins last.
+    """
+
+    verify_source(task, strict=strict)
+    safe_id = re.sub(r"[^a-z0-9_.-]+", "-", task.id.lower()).strip("-._")
+    if not safe_id:
+        raise ValueError(f"Task id cannot form a Docker image name: {task.id!r}")
+    tag = f"assignment/{safe_id}:{task.base_commit[:12]}"
+    base_tag = f"assignment/{safe_id}-base:{task.base_commit[:12]}"
+
+    with tempfile.TemporaryDirectory(prefix="assignment-build-") as temporary:
+        context = Path(temporary) / "context"
+        shutil.copytree(
+            task.source,
+            context,
+            ignore=lambda directory, names: {
+                name
+                for name in names
+                if is_ignored(Path(directory, name).relative_to(task.source))
+            },
+        )
+        build_command = [container_runtime, "build"]
+        if force_build:
+            build_command.append("--no-cache")
+        if platform:
+            build_command.extend(["--platform", platform])
+        build_command.extend(
+            ["--file", str(task.dockerfile), "--tag", base_tag, str(context)]
+        )
+        _run_container_build(build_command, f"base image for {task.id}")
+
+    if not task.pins:
+        tagged = subprocess.run(
+            [container_runtime, "tag", base_tag, tag],
+            capture_output=True,
+            text=True,
+        )
+        if tagged.returncode != 0:
+            raise RuntimeError(f"Could not tag local image: {tagged.stderr.strip()}")
+        return tag
+
+    pins = " ".join(shlex.quote(pin) for pin in task.pins)
+    dockerfile = (
+        f"FROM {base_tag}\n"
+        f"RUN python -m pip install --no-cache-dir {pins}\n"
+    )
+    derived_command = [container_runtime, "build"]
+    if force_build:
+        derived_command.append("--no-cache")
+    if platform:
+        derived_command.extend(["--platform", platform])
+    derived_command.extend(["--tag", tag, "-"])
+    _run_container_build(
+        derived_command,
+        f"pinned image for {task.id}",
+        input_text=dockerfile,
+    )
+    return tag
+
+
+def _run_container_build(
+    command: list[str], description: str, input_text: str | None = None
+) -> None:
+    logger.info("Building local %s", description)
+    try:
+        result = subprocess.run(
+            command,
+            input=input_text,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not run container builder: {exc}") from exc
+    if result.returncode != 0:
+        output = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Could not build {description}:\n{output}")

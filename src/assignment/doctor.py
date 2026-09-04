@@ -1,9 +1,13 @@
-"""Validate local assignment configuration without launching a Modal sandbox."""
+"""Validate assignment configuration without launching a sandbox."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from pathlib import Path
+import shutil
+import subprocess
 from urllib.parse import urlparse
 
 import httpx
@@ -26,14 +30,19 @@ def _configured(name: str) -> str | None:
 
 
 def main() -> int:
+    load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--offline",
         action="store_true",
         help="validate files and credentials without contacting the inference endpoint",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("modal", "docker"),
+        default=os.environ.get("ASSIGNMENT_BACKEND", "modal"),
+    )
     args = parser.parse_args()
-    load_dotenv()
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -45,11 +54,58 @@ def main() -> int:
         except (FileNotFoundError, SourceMismatch, ValueError) as exc:
             failures.append(f"{task_path}: {exc}")
 
-    modal_config = Config()
-    if modal_config.get("token_id") and modal_config.get("token_secret"):
-        print("[ok] Modal credentials are configured")
+    if args.backend == "modal":
+        modal_config = Config()
+        if modal_config.get("token_id") and modal_config.get("token_secret"):
+            print("[ok] Modal credentials are configured")
+        else:
+            failures.append("Modal credentials are missing; run `uv run modal setup`")
     else:
-        failures.append("Modal credentials are missing; run `uv run modal setup`")
+        docker_config = Path(
+            os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker"))
+        ) / "config.json"
+        try:
+            config = json.loads(docker_config.read_text()) if docker_config.is_file() else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.append(f"could not inspect {docker_config}: {exc}")
+            config = {}
+        credential_store = config.get("credsStore")
+        if credential_store:
+            helper = f"docker-credential-{credential_store}"
+            if shutil.which(helper) is None:
+                failures.append(
+                    f"Docker credential helper {helper!r} is configured in "
+                    f"{docker_config} but is not installed; install that helper or "
+                    "remove/change the stale `credsStore` setting"
+                )
+
+        try:
+            docker_info = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"Docker is unavailable: {exc}")
+        else:
+            if docker_info.returncode == 0:
+                try:
+                    context = subprocess.run(
+                        ["docker", "context", "show"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    context_name = context.stdout.strip() if context.returncode == 0 else ""
+                except (OSError, subprocess.TimeoutExpired):
+                    context_name = ""
+                print(f"[ok] Docker backend: {context_name or 'active context'}")
+            else:
+                failures.append(
+                    "Docker daemon is unavailable; start Colima with `colima start`: "
+                    + (docker_info.stderr or docker_info.stdout).strip()
+                )
 
     api_key = _configured("OPENAI_API_KEY")
     base_url = _configured("OPENAI_BASE_URL")
@@ -64,8 +120,13 @@ def main() -> int:
         failures.append("OPENAI_MODEL is missing")
     if base_url:
         parsed = urlparse(base_url)
-        if parsed.scheme != "https" or not parsed.netloc:
-            failures.append("OPENAI_BASE_URL must be a complete HTTPS URL")
+        loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if not parsed.netloc or not (
+            parsed.scheme == "https" or (parsed.scheme == "http" and loopback)
+        ):
+            failures.append(
+                "OPENAI_BASE_URL must use HTTPS, except loopback Ollama URLs may use HTTP"
+            )
         else:
             print(f"[ok] inference endpoint: {parsed.netloc}")
     else:
@@ -101,9 +162,9 @@ def main() -> int:
     if failures:
         for failure in failures:
             print(f"[error] {failure}")
-        print("Configuration is not ready; no Modal sandbox was launched.")
+        print("Configuration is not ready; no sandbox was launched.")
         return 1
-    print("Assignment configuration is ready; no Modal sandbox was launched.")
+    print("Assignment configuration is ready; no sandbox was launched.")
     return 0
 
 

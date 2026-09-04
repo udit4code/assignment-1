@@ -8,6 +8,7 @@ testbed, serves the app, and exposes the game over HTTP.
 from __future__ import annotations
 
 import base64
+from http.client import HTTPException
 import json
 import time
 from pathlib import Path
@@ -19,7 +20,8 @@ import httpx
 from assignment.agent.chess_tools import CHESS_PORT
 from assignment.task import Task
 from assignment.env import Environment
-from assignment.utils.image import build_testbed_image
+from assignment.local_env import LocalDockerEnvironment
+from assignment.utils.image import build_local_testbed_image, build_testbed_image
 
 TESTBED = "/testbed"
 SERVER_LOG = "/tmp/chess-server.log"
@@ -145,7 +147,13 @@ class ChessSandbox(Environment):
                 if response.status == 200 and payload == {"status": "ok"}:
                     return
                 last_error = f"unexpected health response: {payload!r}"
-            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (
+                HTTPError,
+                URLError,
+                HTTPException,
+                TimeoutError,
+                json.JSONDecodeError,
+            ) as exc:
                 last_error = str(exc)
             time.sleep(0.25)
 
@@ -204,13 +212,81 @@ class ChessSandbox(Environment):
             self._client = None
         super().stop(timeout=timeout)
 
+
+class LocalChessSandbox(LocalDockerEnvironment):
+    """A chess server in a disposable Docker container managed by Colima."""
+
+    _apply_patch = ChessSandbox._apply_patch
+    _start_server = ChessSandbox._start_server
+    client = ChessSandbox.client
+    state = ChessSandbox.state
+    play = ChessSandbox.play
+    reset = ChessSandbox.reset
+
+    def __init__(
+        self,
+        task: str | Path | Task | None = None,
+        patch: str | Path | None = None,
+        port: int = CHESS_PORT,
+        strict: bool = True,
+        startup_timeout: float = 300,
+        runtime_timeout: float = 600,
+        deployment_timeout: float = 1800,
+        server_timeout: float = 30,
+        container_runtime: str = "docker",
+        platform: str | None = None,
+    ):
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Invalid port: {port}")
+
+        self.task = task if isinstance(task, Task) else Task.load(task or DEFAULT_TASK)
+        self.port = port
+        self.server_url = ""
+        self._client: httpx.Client | None = None
+
+        image = build_local_testbed_image(
+            self.task,
+            strict=strict,
+            container_runtime=container_runtime,
+            platform=platform,
+        )
+        super().__init__(
+            image=image,
+            startup_timeout=startup_timeout,
+            runtime_timeout=runtime_timeout,
+            deployment_timeout=deployment_timeout,
+            exposed_ports=[port],
+            container_runtime=container_runtime,
+            platform=platform,
+        )
+
+        try:
+            for source in SANDBOX_FILES:
+                self.copy_to(source, f"/opt/assignment/{source.name}")
+            if patch is not None:
+                self._apply_patch(patch)
+            self.server_url = self.tunnel_url(port).rstrip("/")
+            self._start_server(server_timeout)
+            self._client = httpx.Client(base_url=self.server_url, timeout=30)
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self, timeout: float = 10) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        super().stop(timeout=timeout)
+
 def main() -> None:
     """Launch a chess sandbox and keep it alive until the user exits."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Serve the chess app from a Modal sandbox")
+    parser = argparse.ArgumentParser(description="Serve the chess app from a sandbox")
     parser.add_argument("--patch", type=Path, help="Fix to apply before serving, e.g. the part 1 output")
     parser.add_argument("--task", type=Path, help="Task directory to serve the testbed of")
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
+    parser.add_argument("--docker-platform")
     parser.add_argument(
         "--sandbox-timeout",
         type=int,
@@ -219,10 +295,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    with ChessSandbox(
+    sandbox_class = LocalChessSandbox if args.backend == "docker" else ChessSandbox
+    sandbox_kwargs = (
+        {"platform": args.docker_platform} if args.backend == "docker" else {}
+    )
+    with sandbox_class(
         task=args.task,
         patch=args.patch,
         deployment_timeout=args.sandbox_timeout,
+        **sandbox_kwargs,
     ) as sandbox:
         print(f"Chess sandbox ready: {sandbox.server_url}", flush=True)
         try:

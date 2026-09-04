@@ -13,6 +13,7 @@
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -30,6 +31,15 @@ def main() -> int:
     )
     parser.add_argument("--patch", type=Path, help="Unified diff to apply before testing")
     parser.add_argument("--timeout", type=float, default=600, help="Seconds allowed for the test command")
+    parser.add_argument(
+        "--backend",
+        choices=("modal", "docker"),
+        default=os.environ.get("ASSIGNMENT_BACKEND", "modal"),
+    )
+    parser.add_argument(
+        "--docker-platform",
+        default=os.environ.get("DOCKER_DEFAULT_PLATFORM"),
+    )
     parser.add_argument(
         "--no-strict",
         dest="strict",
@@ -51,6 +61,8 @@ def main() -> int:
         task=task,
         timeout=args.timeout,
         strict=args.strict,
+        backend=args.backend,
+        docker_platform=args.docker_platform,
     )
     print(report.summary())
     return 0 if report.resolved else 1

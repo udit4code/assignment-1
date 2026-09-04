@@ -19,6 +19,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 assignment-chess-modal = "assignment.chess_sandbox:main"
+assignment-chess-sandbox = "assignment.chess_sandbox:main"
 assignment-code-agent = "assignment.cli:run_code_agent"
 assignment-doctor = "assignment.doctor:main"
 assignment-play-chess = "assignment.cli:run_chess_agent"

@@ -1,5 +1,7 @@
 .PHONY: setup doctor verify-sources test test-modal test-chess-modal check-part1 check-swebench \
 	run-code-agent run-swebench-agent run-chess-agent \
+	doctor-local run-code-agent-local check-part1-local run-swebench-agent-local \
+	check-swebench-local run-chess-agent-local run-chess-agent-local-skill \
 	run-obs-experiment-no-legal-moves run-obs-experiment-legal-moves \
 	run-obs-deepseek-no-legal run-obs-deepseek-legal \
 	run-obs-gpt-oss-no-legal run-obs-gpt-oss-legal \
@@ -28,6 +30,13 @@ OBS_NO_LEGAL_TRAJECTORY ?= artifacts/part3-no-legal-moves-$(MODEL_TAG).json
 OBS_LEGAL_TRAJECTORY ?= artifacts/part3-legal-moves-$(MODEL_TAG).json
 OBS_NO_LEGAL_RESULT ?= artifacts/part3-no-legal-moves-$(MODEL_TAG)-result.json
 OBS_LEGAL_RESULT ?= artifacts/part3-legal-moves-$(MODEL_TAG)-result.json
+LOCAL_MODEL ?= qwen3:8b
+OLLAMA_BASE_URL ?= http://127.0.0.1:11434/v1
+OLLAMA_API_KEY ?= ollama
+LOCAL_PATCH ?= artifacts/local-fix.patch
+LOCAL_PART1_TRAJECTORY ?= artifacts/local-part1-trajectory.json
+LOCAL_TRAJECTORY ?= artifacts/local-part3-trajectory.json
+LOCAL_RESULT ?= artifacts/local-game-result.json
 
 setup:
 	uv sync
@@ -36,6 +45,11 @@ setup:
 
 doctor:
 	uv run assignment-doctor
+
+doctor-local:
+	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
+	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
+	uv run assignment-doctor --backend docker
 
 verify-sources:
 	uv run python -c "from assignment.task import Task; from assignment.utils.image import verify_source; verify_source(Task.load('tasks/chess-terminal-move'))"
@@ -65,10 +79,27 @@ check-swebench:
 	@test -f "$(SWEBENCH_PATCH)" || (echo "Patch not found: $(SWEBENCH_PATCH). Run make run-swebench-agent INSTANCE=$(INSTANCE) first."; exit 1)
 	uv run python scripts/evaluate_swebench.py $(INSTANCE) --patch $(SWEBENCH_PATCH) -v
 
+check-part1-local:
+	@test -f "$(LOCAL_PATCH)" || (echo "Patch not found: $(LOCAL_PATCH). Run make run-code-agent-local first."; exit 1)
+	uv run python scripts/evaluate.py --backend docker --task $(TASK) \
+		--evaluation $(PUBLIC_EVAL) --patch $(LOCAL_PATCH) -v
+
+check-swebench-local:
+	@test -f "$(SWEBENCH_PATCH)" || (echo "Patch not found: $(SWEBENCH_PATCH)."; exit 1)
+	uv run python scripts/evaluate_swebench.py --backend docker $(INSTANCE) \
+		--patch $(SWEBENCH_PATCH) -v
+
 run-code-agent:
 	uv run assignment-code-agent --task $(TASK) --model $(MODEL) --step-limit $(STEPS) \
 		--skills-path $(CODE_SKILLS) --trajectory $(PART1_TRAJECTORY) \
 		--patch-output $(PATCH)
+
+run-code-agent-local:
+	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
+	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
+	uv run assignment-code-agent --backend docker --task $(TASK) --model "$(LOCAL_MODEL)" \
+		--step-limit $(STEPS) --skills-path $(CODE_SKILLS) \
+		--trajectory $(LOCAL_PART1_TRAJECTORY) --patch-output $(LOCAL_PATCH)
 
 # Run the code agent on a vendored SWE-bench instance, in its published image.
 run-swebench-agent:
@@ -78,10 +109,35 @@ run-swebench-agent:
 		--skills-path $(CODE_SKILLS) \
 		--step-limit $(STEPS) $(if $(filter-out 0,$(COMPACT_THRESHOLD)),--compact-threshold-tokens $(COMPACT_THRESHOLD),)
 
+run-swebench-agent-local:
+	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
+	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
+	uv run assignment-swebench-agent --backend docker $(INSTANCE) --model "$(LOCAL_MODEL)" \
+		--patch-output $(SWEBENCH_PATCH) --trajectory $(SWEBENCH_TRAJECTORY) \
+		--skills-path $(CODE_SKILLS) --step-limit $(STEPS) \
+		$(if $(filter-out 0,$(COMPACT_THRESHOLD)),--compact-threshold-tokens $(COMPACT_THRESHOLD),)
+
 run-chess-agent:
 	uv run assignment-play-chess --model $(MODEL) --task $(TASK) --patch $(PATCH) \
 		--step-limit $(STEPS) --sandbox-timeout $(CHESS_TIMEOUT) \
 		--trajectory $(TRAJECTORY) --result $(RESULT)
+
+run-chess-agent-local:
+	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
+	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
+	uv run assignment-play-chess --backend docker --model "$(LOCAL_MODEL)" \
+		--task $(TASK) --patch $(LOCAL_PATCH) --step-limit $(STEPS) \
+		--sandbox-timeout $(CHESS_TIMEOUT) --trajectory $(LOCAL_TRAJECTORY) \
+		--result $(LOCAL_RESULT)
+
+run-chess-agent-local-skill:
+	OPENAI_BASE_URL="$(OLLAMA_BASE_URL)" OPENAI_API_KEY="$(OLLAMA_API_KEY)" \
+	OPENAI_MODEL="$(LOCAL_MODEL)" OPENAI_API_STYLE=ollama ASSIGNMENT_BACKEND=docker \
+	uv run assignment-play-chess --backend docker --programmatic-tools \
+		--skills-path tasks/chess-skills --model "$(LOCAL_MODEL)" --task $(TASK) \
+		--patch $(LOCAL_PATCH) --step-limit $(STEPS) --sandbox-timeout $(CHESS_TIMEOUT) \
+		--trajectory artifacts/local-part3-python-skill-trajectory.json \
+		--result artifacts/local-python-skill-result.json
 
 run-obs-experiment-no-legal-moves:
 	uv run assignment-play-chess --model $(MODEL) --task $(TASK) --patch $(PATCH) \

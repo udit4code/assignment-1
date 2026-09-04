@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -94,6 +95,18 @@ class Agent:
         base_url = os.environ.get("OPENAI_BASE_URL")
         if not base_url:
             raise RuntimeError("OPENAI_BASE_URL is not set.")
+        api_style = os.environ.get("OPENAI_API_STYLE", "").strip().lower()
+        if not api_style:
+            parsed_base_url = urlparse(base_url)
+            api_style = (
+                "ollama"
+                if parsed_base_url.hostname in {"localhost", "127.0.0.1", "::1"}
+                and parsed_base_url.port == 11434
+                else "openai"
+            )
+        if api_style not in {"openai", "ollama"}:
+            raise RuntimeError("OPENAI_API_STYLE must be 'openai' or 'ollama'.")
+        self.api_style = api_style
         try:
             max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", "5"))
         except ValueError as exc:
@@ -269,12 +282,17 @@ class Agent:
             flush=True,
         )
         try:
+            token_limit = (
+                {"max_tokens": 4096}
+                if self.api_style == "ollama"
+                else {"max_completion_tokens": 4096}
+            )
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=self.tools,
                 reasoning_effort="medium",
-                max_completion_tokens=4096,
+                **token_limit,
             )
         except Exception as exc:
             print(
@@ -416,11 +434,16 @@ class Agent:
         ]
 
         ### Do not modify this section ###
+        token_limit = (
+            {"max_tokens": self.compaction_max_tokens}
+            if self.api_style == "ollama"
+            else {"max_completion_tokens": self.compaction_max_tokens}
+        )
         compaction_response = self.client.chat.completions.create(
             model=self.model,
             messages=compaction_prompt,
             reasoning_effort="medium",
-            max_completion_tokens=self.compaction_max_tokens,
+            **token_limit,
         )
 
         compaction_response_dump = compaction_response.model_dump(mode="json")

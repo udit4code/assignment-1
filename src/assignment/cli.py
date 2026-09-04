@@ -11,13 +11,29 @@ from assignment.agent import (
     ChessAgent,
     CodeAgent,
 )
-from assignment.chess_sandbox import ChessSandbox
+from assignment.chess_sandbox import ChessSandbox, LocalChessSandbox
 from assignment.task import Task
 from assignment.env import Environment
-from assignment.utils.image import build_testbed_image
+from assignment.local_env import LocalDockerEnvironment
+from assignment.utils.image import build_local_testbed_image, build_testbed_image
 from assignment.eval.instances import available, load as load_instance
 
 DEFAULT_TASK = Path("tasks/chess-terminal-move")
+BACKENDS = ("modal", "docker")
+
+
+def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default=os.environ.get("ASSIGNMENT_BACKEND", "modal"),
+        help="sandbox backend; docker uses the active Docker context (for example Colima)",
+    )
+    parser.add_argument(
+        "--docker-platform",
+        default=os.environ.get("DOCKER_DEFAULT_PLATFORM"),
+        help="optional Docker platform, for example linux/amd64 on Apple Silicon",
+    )
 
 
 def _compact_threshold(value: str) -> int | None:
@@ -53,6 +69,7 @@ def _add_code_agent_arguments(parser: argparse.ArgumentParser) -> None:
     """The arguments both code-agent runners take, so they cannot drift apart."""
     parser.add_argument("--model")
     parser.add_argument("--step-limit", type=int, default=100)
+    _add_backend_arguments(parser)
     _add_compaction_argument(parser)
     parser.add_argument(
         "--skills-path",
@@ -97,10 +114,23 @@ def run_code_agent() -> None:
     task = Task.load(args.task)
     model = _model(args.model)
 
+    if args.backend == "docker":
+        image = build_local_testbed_image(task, platform=args.docker_platform)
+        environment_class = LocalDockerEnvironment
+        environment_kwargs = {
+            "platform": args.docker_platform,
+            "docker_args": ["--network", "none"],
+        }
+    else:
+        image = build_testbed_image(task)
+        environment_class = Environment
+        environment_kwargs = {}
+
     submitted_patch = ""
-    with Environment(
-        image=build_testbed_image(task),
+    with environment_class(
+        image=image,
         cwd="/testbed",
+        **environment_kwargs,
     ) as environment:
         agent = CodeAgent(
             task=task.problem_statement,
@@ -146,12 +176,25 @@ def run_swebench_agent() -> None:
     )
     print(f"Image: {instance.image}", flush=True)
 
+    if args.backend == "docker":
+        environment_class = LocalDockerEnvironment
+        environment_kwargs = {
+            "platform": args.docker_platform,
+            "docker_args": ["--network", "none"],
+        }
+    else:
+        environment_class = Environment
+        environment_kwargs = {}
+
     submitted_patch = ""
     # SWE-bench images install the repository into a conda env named `testbed`
     # but never activate it, so without this `python` is conda's base env and
     # the repository's own dependencies are missing.
-    with Environment(
-        image=instance.image, cwd="/testbed", conda_env="testbed"
+    with environment_class(
+        image=instance.image,
+        cwd="/testbed",
+        conda_env="testbed",
+        **environment_kwargs,
     ) as environment:
         agent = CodeAgent(
             task=instance.problem_statement,
@@ -186,6 +229,7 @@ def run_chess_agent() -> None:
     parser.add_argument("--task", type=Path, default=DEFAULT_TASK)
     parser.add_argument("--model")
     parser.add_argument("--step-limit", type=int, default=200)
+    _add_backend_arguments(parser)
     _add_compaction_argument(parser)
     parser.add_argument("--skills-path", type=Path)
     parser.add_argument("--programmatic-tools", action="store_true")
@@ -208,10 +252,15 @@ def run_chess_agent() -> None:
         )
 
     model = _model(args.model)
-    with ChessSandbox(
+    sandbox_class = LocalChessSandbox if args.backend == "docker" else ChessSandbox
+    sandbox_kwargs = (
+        {"platform": args.docker_platform} if args.backend == "docker" else {}
+    )
+    with sandbox_class(
         task=args.task,
         patch=patch,
         deployment_timeout=args.sandbox_timeout,
+        **sandbox_kwargs,
     ) as sandbox:
         print(f"Chess server: {sandbox.server_url}", flush=True)
         agent = ChessAgent(
