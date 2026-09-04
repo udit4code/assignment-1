@@ -152,6 +152,28 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        # To support the ReAct loop, we will need to track the conversation history.
+        # This will be implemented as a list of dictionaries, where each dictionary represents a message in the conversation.
+        # Each message will have a role (e.g., "user", "assistant", "system") and content (the text of the message).
+        # This will allow the agent to build prompts that include the entire conversation history, enabling it to make informed decisions based on past interactions.
+        # Dictionary keys are strings such as "role", "content", and "tool_calls".
+        # Values use "Any" because some values are strings, lists, nested dictionaries, or None
+        # For example, it can look like this:
+        # [
+        #     {
+        #         "role": "assistant",
+        #         "content": "I will inspect the files.",
+        #         "tool_calls": [...]
+        #     },
+        #     {
+        #         "role": "tool",
+        #         "tool_call_id": "call_1",
+        #         "content": "README.md\nsrc\ntests"
+        #     }
+        # ]
+        # As it is placed inside the constructor of the Agent class, it will be initialized as an empty list when an Agent instance is created.
+        # This gives every agent instance its own independent history.
+        self.conversation_history: list[dict[str, Any]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -227,7 +249,43 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        
+        # What is deepcopy() versus shallowcopy() debate ? 
+        # Say, original = [1, 2, 3] and another = original.
+        # In this case, Python does not create a second list here. Both variables refer to the same list. 
+        # So, another.append(4) and if we print(original), we will get original as [1, 2, 3, 4], eventhough we did not append to original. 
+        # Hence, Changing the object through one references makes the change visible through every available reference. 
+        # Here, both original and another are references to the same list object.
+        # NOW, what is a deepcopy() ? 
+        # A deepcopy recursively copies the outer container and its nested mutable objects. 
+        # So, when we do independent = deepcopy(original), the structure is now conceptually as follows : 
+        # original list
+        #     └── original message dictionary
+        #             └── original tool_calls list
+        #                     └── original tool-call dictionary
+        # independent list
+        #     └── copied message dictionary
+        #             └── copied tool_calls list
+        #                     └── copied tool-call dictionary
+        # Changing the copy no longer changes the original, as : 
+        # independent[0]["tool_calls"][0]["id"] = "changed" 
+        # print(original[0]["tool_calls"][0]["id"]) will still print call_1, not changed.
+        # Why does build_prompt(self) need deepcopy() ? 
+        # Because, the stored history belongs to the agent and build_prompt() gives another part of the program a constructed prompt.
+        # So, if we had used *self.conversation_history instead of *deepcopy(self.conversation_history), 
+        # the caller could change the returned prompt and corrupt the agent's stored conversation state, because
+        # the * creates a new outer list, but the history dictionaries remain shared. This is effectively a shallow copy.
+        # Without deepcopy(), the agent’s memory would be corrupted through the returned prompt.
+        # Using *deepcopy(self.conversation_history) creates an independent snapshot. 
+        # The model client, logging code, tests, or compaction logic can handle the returned prompt without being able to mutate the agent’s stored history accidentally.
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.task_prompt},
+            # Messages contain nested mutable lists/dicts such as tool_calls.
+            # deepcopy prevents a caller from changing those objects through
+            # the returned prompt and corrupting our stored conversation state.
+            *deepcopy(self.conversation_history),
+        ]
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
