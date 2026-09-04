@@ -206,6 +206,13 @@ class ChessAgent(Agent):
                 )
                 continue
 
+            if name == "invoke_skill":
+                add_observation(
+                    call_id,
+                    _invoke_skill(self.skills, arguments),
+                )
+                continue
+
             if name == "simulate_move":
                 add_observation(
                     call_id,

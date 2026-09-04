@@ -164,10 +164,31 @@ def _run_python(env: Any, port: int, arguments: str) -> str:
 
 def _invoke_skill(skills: dict[str, dict[str, str]], arguments: str) -> str:
     """Existing tool: load one skill's instructions into the conversation."""
-    # TODO(3.5): parse the arguments and return the named skill's content.
-    # Return <chess_error>{message}</chess_error> if there are issues like type
-    # mismatches or parsing failures.
-    raise NotImplementedError
+
+    def chess_error(message: str) -> str:
+        return f"<chess_error>{message}</chess_error>"
+
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return chess_error(f"Invalid invoke_skill JSON: {exc}")
+
+    if not isinstance(parsed, dict):
+        return chess_error("invoke_skill arguments must be a JSON object")
+    if set(parsed) != {"name"}:
+        return chess_error("invoke_skill requires exactly one argument named name")
+
+    name = parsed["name"]
+    if not isinstance(name, str) or not name.strip():
+        return chess_error("skill name must be a non-empty string")
+    if name not in skills:
+        return chess_error(f"Unknown skill: {name}")
+
+    skill = skills[name]
+    content = skill.get("content") if isinstance(skill, dict) else None
+    if not isinstance(content, str):
+        return chess_error(f"Skill has no readable content: {name}")
+    return content
 
 
 def _game_state(client: httpx.Client, reset: bool = False) -> dict:
