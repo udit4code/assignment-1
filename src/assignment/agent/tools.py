@@ -153,8 +153,38 @@ PLAY_MOVE_TOOL: dict = {
     },
 }
 
-# TODO(3.3): Define the `simulate_move` tool, like the `play_move` tool.
-SIMULATE_MOVE_TOOL: dict = {}
+SIMULATE_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "simulate_move",
+        "description": (
+            "Inspect a chess position or simulate exactly one ply without "
+            "changing the live board. Supply a complete six-field FEN and, "
+            "optionally, a move in UCI notation such as e2e4."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fen": {
+                    "type": "string",
+                    "description": "The complete six-field FEN to inspect.",
+                },
+                "move": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "A UCI move to apply for one ply, or null to inspect "
+                        "only the supplied position."
+                    ),
+                },
+            },
+            # Strict schemas list every property as required. Null represents
+            # the optional/default value of move.
+            "required": ["fen", "move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO()
 RUN_PYTHON_TOOL: dict = {}
