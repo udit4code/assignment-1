@@ -16,6 +16,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import yaml
 
 from assignment.env import Environment
 from assignment.agent.tools import INVOKE_SKILL_TOOL
@@ -27,10 +28,13 @@ DEFAULT_COMPACTION_KEEP_RECENT_STEPS = 1
 DEFAULT_COMPACTION_MAX_TOKENS = 1_200
 MAX_OBSERVATION_CHARS = 10_000
 
-# TODO(Part 2): Write instructions that make the model produce concise working
-# memory for a software agent. The prompt should preserve concrete progress,
-# failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = """You create concise, factual working memory for a
+software agent. Summarize only the supplied older conversation. Preserve the
+objective and constraints; relevant files, symbols, and commands; edits already
+made; concrete results and errors; failed approaches and why they failed; tests
+and their outcomes; current blockers; and the next intended action. Do not copy
+large raw outputs, invent facts, or include conversational filler. Return only
+the working-memory summary."""
 
 
 class StepLimitError(Exception):
@@ -178,15 +182,81 @@ class Agent:
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
 
-        # TODO(1.4): Validate ``skills_path``, discover one ``SKILL.md``
-        # per child directory, parse its YAML frontmatter (what's between the
-        # `---` tags at the head of the file), and return a mapping
-        # keyed by the frontmatter ``name``. Each value must contain a concise
-        # ``metadata`` string for the model's skill catalog and the complete
-        # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
-        # names and malformed or missing frontmatter with a clear
-        # ``ValueError``.
-        raise NotImplementedError
+        if not skills_path.exists():
+            raise ValueError(f"Skills path does not exist: {skills_path}")
+        if not skills_path.is_dir():
+            raise ValueError(f"Skills path is not a directory: {skills_path}")
+
+        skills: dict[str, dict[str, str]] = {}
+        skill_directories = sorted(
+            (path for path in skills_path.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+        )
+
+        for skill_directory in skill_directories:
+            skill_file = skill_directory / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(
+                    f"Skill directory is missing SKILL.md: {skill_directory}"
+                )
+
+            try:
+                content = skill_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f"Could not read skill file {skill_file}: {exc}") from exc
+
+            lines = content.splitlines()
+            if not lines or lines[0].strip() != "---":
+                raise ValueError(
+                    f"Skill file must start with YAML frontmatter: {skill_file}"
+                )
+
+            try:
+                frontmatter_end = next(
+                    index
+                    for index, line in enumerate(lines[1:], start=1)
+                    if line.strip() == "---"
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    f"Skill file has unclosed YAML frontmatter: {skill_file}"
+                ) from exc
+
+            try:
+                frontmatter = yaml.safe_load("\n".join(lines[1:frontmatter_end]))
+            except yaml.YAMLError as exc:
+                raise ValueError(
+                    f"Skill file has malformed YAML frontmatter: {skill_file}"
+                ) from exc
+
+            if not isinstance(frontmatter, dict):
+                raise ValueError(
+                    f"Skill frontmatter must be a YAML mapping: {skill_file}"
+                )
+
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"Skill frontmatter needs a non-empty string name: {skill_file}"
+                )
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError(
+                    "Skill frontmatter needs a non-empty string description: "
+                    f"{skill_file}"
+                )
+
+            name = name.strip()
+            description = description.strip()
+            if name in skills:
+                raise ValueError(f"Duplicate skill name: {name}")
+
+            skills[name] = {
+                "metadata": f"name: {name}\ndescription: {description}",
+                "content": content,
+            }
+
+        return skills
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -314,18 +384,36 @@ class Agent:
         """Replace parts of prompt with model-generated working memory. Changes the
         content that `build_prompt` emits."""
 
-        # TODO(2.1): Prompt the model to compact the context. The system
-        # prompt should ask for concise factual working memory and preserve
-        # the objective, constraints, files, commands, edits, concrete
-        # results, failed approaches, tests, blockers, and next action.
-        # Summarize only an old prefix; retain the original system/task
-        # messages verbatim and at least the latest complete assistant action
-        # with all linked tool observations. The resulting summary should change
-        # what `build_prompt` emits, and reduce the length of the prompt.
+        assistant_indices = [
+            index
+            for index, message in enumerate(self.conversation_history)
+            if message.get("role") == "assistant"
+        ]
+        if len(assistant_indices) <= self.compaction_keep_recent_steps:
+            raise ValueError("Not enough completed steps to compact context.")
 
-        raise NotImplementedError
+        retained_start = assistant_indices[-self.compaction_keep_recent_steps]
+        old_history = deepcopy(self.conversation_history[:retained_start])
+        recent_history = deepcopy(self.conversation_history[retained_start:])
 
-        compaction_prompt = []
+        compaction_prompt = [
+            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Use the following original standing instructions and task "
+                    "as context when summarizing the older interaction.\n\n"
+                    f"<original_system_prompt>\n{self.system_prompt}\n"
+                    "</original_system_prompt>\n\n"
+                    f"<original_task>\n{self.task_prompt}\n</original_task>"
+                ),
+            },
+            *old_history,
+            {
+                "role": "user",
+                "content": "Return concise working memory for the interaction above.",
+            },
+        ]
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -335,8 +423,22 @@ class Agent:
             max_completion_tokens=self.compaction_max_tokens,
         )
 
-        return compaction_prompt, compaction_response.model_dump(mode="json")
+        compaction_response_dump = compaction_response.model_dump(mode="json")
         ##################################
+
+        summary = compaction_response.choices[0].message.content
+        if not isinstance(summary, str) or not summary.strip():
+            raise RuntimeError("Compaction model returned an empty summary.")
+
+        self.conversation_history = [
+            {
+                "role": "user",
+                "content": f"<working_memory>\n{summary.strip()}\n</working_memory>",
+            },
+            *recent_history,
+        ]
+
+        return compaction_prompt, compaction_response_dump
 
     def maybe_compact_context(self) -> bool:
         """Compact before the next action request when the threshold is reached."""
