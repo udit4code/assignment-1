@@ -9,9 +9,11 @@ from assignment.agent.base import (
     DEFAULT_COMPACTION_KEEP_RECENT_STEPS,
     DEFAULT_COMPACTION_MAX_TOKENS,
     Agent,
+    format_tool_output,
 )
 from assignment.agent.tools import EXECUTE_TOOL, SEND_MESSAGE_TOOL
 from assignment.env import Environment
+
 
 class CodeAgent(Agent):
     """An agent that fixes a software issue and submits a git patch."""
@@ -43,21 +45,188 @@ class CodeAgent(Agent):
         self.task = task
         self.submitted_patch = ""
 
-        # TODO(Part 1.3): Make the `execute` and `send_message` tools available
-        # to the agent.
+        self.tools.extend([EXECUTE_TOOL, SEND_MESSAGE_TOOL])
 
-        # TODO(1.1.b): Construct the system prompt and task_prompt. These
-        # should be usable by the `Agent.build_prompt` method.
-        # TODO(1.4): If any skills are available to the agent, make their
-        # descriptions/metadata available to the agent in the prompt.
+        system_information = json.dumps(
+            {
+                "machine": environment.machine,
+                "release": environment.release,
+                "system": environment.system,
+                "version": environment.version,
+            },
+            indent=2,
+        )
+        self.system_prompt = (
+            "You are a software engineering agent working in a sandboxed "
+            "repository. Use the available tools to inspect the repository, "
+            "implement the requested fix, and verify it with relevant tests. "
+            "Base your conclusions on tool observations. When the task is "
+            "complete, call `send_message` with a concise summary.\n\n"
+            f"<system_information>\n{system_information}\n</system_information>"
+        )
+        self.task_prompt = task
+
+        if self.skills:
+            catalog = "\n".join(skill["metadata"] for skill in self.skills.values())
+            self.system_prompt += (
+                "\n\nReusable skills are available. Call `invoke_skill` with a "
+                "skill's name to load its instructions, and follow them in place "
+                f"of your default approach.\n\n<skills>\n{catalog}\n</skills>\n"
+            )
 
     def execute_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
         """Execute ``execute`` and ``send_message`` calls in the code sandbox."""
 
-        # TODO(Part 1.3): Parse each call, execute recognized tools, and return
-        # one message per call (there may be multiple tool calls in one agent
-        # response!). Malformed JSON and unknown tools must become recoverable
-        # observations relayed to the agent instead of exceptions.
-        raise NotImplementedError
+        observations: list[dict[str, str]] = []
+
+        def add_observation(call_id: str, content: str) -> None:
+            observations.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                }
+            )
+
+        def tool_error(message: str) -> str:
+            return f"<tool_error>{message}</tool_error>"
+
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                add_observation("unknown", tool_error("Malformed tool call."))
+                continue
+            call_id = str(call.get("id", "unknown"))
+            function = call.get("function")
+            if not isinstance(function, dict):
+                add_observation(call_id, tool_error("Malformed tool call."))
+                continue
+
+            name = function.get("name")
+            raw_arguments = function.get("arguments")
+            if not isinstance(name, str) or not isinstance(raw_arguments, str):
+                add_observation(
+                    call_id,
+                    tool_error("Tool name and arguments must be strings."),
+                )
+                continue
+
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as exc:
+                add_observation(
+                    call_id,
+                    tool_error(f"Arguments are not valid JSON: {exc.msg}."),
+                )
+                continue
+
+            if not isinstance(arguments, dict):
+                add_observation(
+                    call_id,
+                    tool_error("Tool arguments must be a JSON object."),
+                )
+                continue
+
+            if name == "execute":
+                allowed = {"command", "shell", "cwd", "timeout", "env"}
+                extra = set(arguments) - allowed
+                command = arguments.get("command")
+                valid_command = isinstance(command, str) or (
+                    isinstance(command, list)
+                    and all(isinstance(part, str) for part in command)
+                )
+                shell = arguments.get("shell")
+                cwd = arguments.get("cwd")
+                timeout = arguments.get("timeout")
+                env = arguments.get("env")
+                valid_env = env is None or (
+                    isinstance(env, dict)
+                    and all(
+                        isinstance(key, str) and isinstance(value, str)
+                        for key, value in env.items()
+                    )
+                )
+
+                if extra:
+                    add_observation(
+                        call_id,
+                        tool_error(
+                            "Unknown execute argument(s): "
+                            + ", ".join(sorted(extra))
+                            + "."
+                        ),
+                    )
+                elif "command" not in arguments or not valid_command:
+                    add_observation(
+                        call_id,
+                        tool_error("execute requires command to be a string or string list."),
+                    )
+                elif shell is not None and not isinstance(shell, bool):
+                    add_observation(
+                        call_id,
+                        tool_error("execute shell must be a boolean or null."),
+                    )
+                elif cwd is not None and not isinstance(cwd, str):
+                    add_observation(
+                        call_id,
+                        tool_error("execute cwd must be a string or null."),
+                    )
+                elif timeout is not None and (
+                    isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                ):
+                    add_observation(
+                        call_id,
+                        tool_error("execute timeout must be a number or null."),
+                    )
+                elif not valid_env:
+                    add_observation(
+                        call_id,
+                        tool_error("execute env must map strings to strings or be null."),
+                    )
+                else:
+                    result = self.env.execute(
+                        command,
+                        shell=shell,
+                        cwd=cwd,
+                        timeout=timeout,
+                        env=env,
+                    )
+                    add_observation(call_id, format_tool_output(result))
+
+            elif name == "send_message":
+                if set(arguments) != {"summary"} or not isinstance(
+                    arguments.get("summary"), str
+                ):
+                    add_observation(
+                        call_id,
+                        tool_error("send_message requires exactly one string summary."),
+                    )
+                else:
+                    summary = arguments["summary"]
+                    self.finished = True
+                    add_observation(call_id, summary)
+
+            elif name == "invoke_skill" and self.skills:
+                if set(arguments) != {"name"} or not isinstance(
+                    arguments.get("name"), str
+                ):
+                    add_observation(
+                        call_id,
+                        tool_error("invoke_skill requires exactly one string name."),
+                    )
+                elif arguments["name"] not in self.skills:
+                    add_observation(
+                        call_id,
+                        tool_error(f"Unknown skill: {arguments['name']}."),
+                    )
+                else:
+                    add_observation(
+                        call_id,
+                        self.skills[arguments["name"]]["content"],
+                    )
+
+            else:
+                add_observation(call_id, tool_error(f"Unknown tool: {name}."))
+
+        return observations
