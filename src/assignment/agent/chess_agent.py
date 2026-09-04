@@ -169,7 +169,7 @@ class ChessAgent(Agent):
             for tool in self.tools
             if isinstance(tool, dict)
         }
-        play_move_seen = False
+        live_action_seen = False
 
         def add_observation(call_id: str, content: str) -> None:
             observations.append(
@@ -213,22 +213,62 @@ class ChessAgent(Agent):
                 )
                 continue
 
+            if name == "run_python":
+                if live_action_seen:
+                    add_observation(
+                        call_id,
+                        chess_error(
+                            "Only one live-board action can be executed per "
+                            "model response."
+                        ),
+                    )
+                    continue
+
+                live_action_seen = True
+                result = _run_python(
+                    self.env,
+                    self.python_sandbox_port,
+                    arguments,
+                )
+                if result.startswith("<chess_error>"):
+                    add_observation(call_id, result)
+                    continue
+
+                try:
+                    state = _game_state(self.chess_client)
+                except Exception as exc:
+                    add_observation(
+                        call_id,
+                        chess_error(
+                            "Python ran, but the live board could not be refreshed: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                    continue
+                self.last_state = state
+                self.finished = bool(state.get("game_over"))
+                add_observation(
+                    call_id,
+                    f"{result}\n\n{self.format_state(state)}",
+                )
+                continue
+
             if name != "play_move":
                 add_observation(
                     call_id,
                     chess_error(f"Tool is not implemented yet: {name}."),
                 )
                 continue
-            if play_move_seen:
+            if live_action_seen:
                 add_observation(
                     call_id,
                     chess_error(
-                        "Only one play_move call can be executed per model response."
+                        "Only one live-board action can be executed per model response."
                     ),
                 )
                 continue
 
-            play_move_seen = True
+            live_action_seen = True
             result = _play_move(self.chess_client, arguments)
             if result.startswith("<chess_error>"):
                 add_observation(call_id, result)

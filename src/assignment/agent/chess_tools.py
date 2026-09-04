@@ -115,25 +115,51 @@ def _run_python(env: Any, port: int, arguments: str) -> str:
     implementations and the chess server, so code the model wrote never
     executes in the agent process.
     """
-    # TODO(3.4): parse the arguments and run the code in the
-    # sandbox with the registered tools available by name.
-    #
-    # `/opt/assignment/sandbox_python.py` is a script on the `env` sandbox
-    # that has access to the same tool definitions in this file. Use it to run
-    # the code that the model produced as an argument to the run_python tool.
-    # The script accepts two positional arguments -- `port` and a base64-encoded
-    # string of code (to prevent issues with quoting). Implement this tool
-    # call.
-    #
-    # The script prints one JSON object with `stdout`, `stderr`, and `error`
-    # from running the code -- return that string as it is.
-    #
-    # A non-zero returncode means the sandbox itself failed, not the model's
-    # code. Report `exception_info` or `stderr` as a <chess_error>.
-    #
-    # Return <chess_error>{message}</chess_error> if there are issues like type
-    # mismatches or parsing failures.
-    raise NotImplementedError
+    def chess_error(message: str) -> str:
+        return f"<chess_error>{message}</chess_error>"
+
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return chess_error(f"Invalid run_python JSON: {exc}")
+
+    if not isinstance(parsed, dict):
+        return chess_error("run_python arguments must be a JSON object")
+    if set(parsed) != {"code"}:
+        return chess_error("run_python requires exactly one argument named code")
+
+    code = parsed["code"]
+    if not isinstance(code, str) or not code.strip():
+        return chess_error("code must be a non-empty string")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return chess_error("sandbox port must be an integer from 1 to 65535")
+
+    encoded_code = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    result = env.execute(
+        [
+            "python",
+            "/opt/assignment/sandbox_python.py",
+            str(port),
+            encoded_code,
+        ],
+        shell=False,
+    )
+    if not isinstance(result, dict):
+        return chess_error("Sandbox returned an invalid command result")
+
+    if result.get("returncode") != 0:
+        detail = (
+            result.get("exception_info")
+            or result.get("stderr")
+            or result.get("output")
+            or f"sandbox runner exited with code {result.get('returncode')}"
+        )
+        return chess_error(str(detail).strip())
+
+    output = result.get("output", result.get("stdout"))
+    if not isinstance(output, str):
+        return chess_error("Sandbox runner produced no text output")
+    return output
 
 
 def _invoke_skill(skills: dict[str, dict[str, str]], arguments: str) -> str:
