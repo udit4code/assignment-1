@@ -618,6 +618,238 @@ each model and sandbox call, a run/trace ID, secret redaction, and export to the
 organisation's logging and metrics platform. LangGraph plus LangSmith would be
 one reasonable implementation choice, not the definition of production.
 
+### Conversation compaction: what it is, when it triggers, and how to tune it
+
+Conversation compaction is the act of replacing old, verbose conversation turns with a smaller representation that preserves the facts needed for future decisions.
+
+An LLM cannot remember an unlimited history for free. Every normal model call receives the current prompt again: system instructions, task, skills, previous assistant tool calls, and tool observations. If that history grows, three bad things happen:
+
+1. It can exceed the model context window and fail.
+2. It increases input-token cost and prompt-processing latency on every later call.
+3. The model can become distracted by stale, repeated, or irrelevant information.
+
+Compaction is an attempt to pay one deliberate cost now to reduce many later costs.
+
+#### First-principles cost model
+
+Without compaction, later prompts get progressively larger:
+
+~~~text
+Task model input at step 1:  system + task
+Task model input at step 2:  system + task + step 1
+Task model input at step 3:  system + task + step 1 + step 2
+...
+Task model input at step N:  system + task + all prior steps
+~~~
+
+The total input work is roughly the sum of all prompt sizes. It can grow close to quadratically with the number and size of turns.
+
+With compaction, the loop occasionally spends an extra LLM request to replace an old block with a short summary:
+
+~~~text
+Old history:  [step 1, step 2, ... step 12]  = 18,000 tokens
+Compaction:   summarize that block             = extra model request
+New memory:   [working-memory summary]         = perhaps 1,000 tokens
+Active prompt: summary + recent exact turns
+~~~
+
+Compaction is worthwhile only if the token, latency, and quality cost of creating the summary is less than the future savings it creates.
+
+A rough decision rule is:
+
+~~~text
+Compact when:
+
+  future task-model input tokens avoided
+    > compaction-input tokens
+    + compaction-output tokens
+    + quality/risk cost of losing detail
+
+and when reducing prompt size prevents a context-window failure or improves
+model focus.
+~~~
+
+This means aggressive compaction is not automatically good. If the agent has only one or two turns left, a summary call may cost more than it saves. If the conversation contains exact error output or code that the next action needs, a lossy summary can make the agent worse.
+
+#### Exactly when our code triggers compaction
+
+The generic Agent class owns this behavior in base.py. Agent.run calls maybe_compact_context immediately before every normal task-model request.
+
+~~~text
+run loop:
+  check step limit
+  maybe_compact_context()
+  query_language_model()     <- normal task reasoning call
+  execute tool calls
+~~~
+
+Compaction is attempted only when all of these conditions are true:
+
+| Gate | Current implementation |
+| --- | --- |
+| Feature enabled | compact_threshold_tokens is not None. |
+| Estimated context is large enough | estimate_active_prompt_tokens() is at or above compact_threshold_tokens. |
+| Enough completed agent turns exist | There must be more assistant turns than compaction_keep_recent_steps. |
+| Not too soon since last summary | At least MIN_COMPACTION_STEP_INTERVAL = 3 normal agent steps passed since the previous compaction. |
+
+The practical defaults and entry points are:
+
+| Knob | Current value/behavior | Meaning |
+| --- | --- | --- |
+| compact_threshold_tokens | CLI default: None; zero is also converted to None. | Compaction is disabled unless a positive threshold is passed. |
+| Part 1 Make target | Does not pass a compaction threshold. | Normal Part 1 code-agent runs do not compact by default. |
+| SWE-bench Make target | COMPACT_THRESHOLD defaults to 6000 and is passed when non-zero. | Typical SWE-bench runs do compact after estimated active context reaches 6,000 tokens. |
+| compaction_keep_recent_steps | Default 1. | Keep the latest assistant action and its following observations verbatim. Compact older history. |
+| compaction_max_tokens | Generic default 1200; SWE-bench Make target uses 1600. | Maximum completion-token budget requested for the summary. |
+| MIN_COMPACTION_STEP_INTERVAL | 3. | A hysteresis guard against compacting on every turn. |
+| MAX_COMPACTION_ATTEMPTS | 3. | Retries only an empty summary result, not every possible model/API error. |
+| compaction reasoning effort | low in CodeAgent. | Tries to make summarization cheaper/faster than primary task reasoning. |
+
+A detail worth remembering: compaction requests use the same configured model as the task agent. They are separate model API calls, and they do **not** increment steps_taken. Therefore a run can stay within a 30-step action budget yet still spend real tokens, time, and money on compaction. The trajectory records these calls under its separate compactions field.
+
+#### How our implementation works under the hood
+
+When the gates pass, compact_context performs these steps:
+
+~~~text
+1. Find every assistant message in conversation_history.
+
+2. Keep the most recent compaction_keep_recent_steps assistant turns and the
+   tool observations that follow them as exact, verbatim history.
+
+3. Take all older history and send it to the compaction model with:
+   - a compaction system prompt,
+   - the original system prompt,
+   - the original task,
+   - the old conversation turns,
+   - an instruction to return concise factual working memory.
+
+4. Require a non-empty response. Retry up to three times if the response is
+   empty.
+
+5. Replace old history with one user message:
+      <working_memory>
+      summary text
+      </working_memory>
+
+6. Append the preserved recent history after that summary.
+~~~
+
+The summary prompt explicitly asks the model to preserve the objective and constraints, relevant files/symbols/commands, verified edits and tests, failures and blockers, and the next intended action. It also tells the model not to invent success and not to recommend forbidden Git mutations.
+
+The result is a **rolling summary**. At the next compaction, the old working-memory message itself can be included in the next summary along with newly old turns. This is memory-efficient, but it introduces a risk of gradual information loss or distortion over repeated summarizations.
+
+Token estimation is deliberately approximate. rough_message_tokens estimates token count from serialized character count. Once an API response reports actual prompt usage, estimate_active_prompt_tokens calibrates from that last actual value plus the approximate growth since then. This is cheaper than a provider-specific tokenizer, but it is not an exact preflight guarantee.
+
+#### What compaction preserves and what it can lose
+
+| Usually preserved well | At risk of loss |
+| --- | --- |
+| Task objective and high-level constraints | Exact source lines, long stack traces, command flags, and full test output. |
+| Relevant files and symbols | Fine-grained chronology: which failed command happened before which edit. |
+| Broad conclusion: test passed/failed, root cause found/not found | Nuance such as a test being a baseline result rather than post-edit verification. |
+| Next intended action | Details that the summarizer judged unimportant but a future repair needs. |
+| Repeated/no-progress patterns, if prompt follows instructions | Facts silently omitted or inaccurately paraphrased by a fallible model. |
+
+This is why the CodeAgent design keeps objective state outside the summary where possible. The Python attributes such as phase, verification_status, change revision, and Git-diff status are authoritative. Every new tool observation also carries a fresh agent-state block. The summary helps the model reason; it should not be the only source of safety-critical facts.
+
+#### Benefits and costs
+
+| Benefit | Why it matters | Cost or risk |
+| --- | --- | --- |
+| Avoids context overflow | Long runs can continue instead of failing at model context limit. | Summary request itself can fail or return empty. |
+| Reduces later input tokens | Lowers cost and prefill latency for future task calls. | Adds immediate input/output tokens for the summary call. |
+| Removes stale detail | Can improve model focus and reduce repeated browsing. | Can remove useful detail or cause a misleading abstraction. |
+| Enables more steps in a fixed context window | Important for long debugging trajectories. | Does not reduce the number of model calls; in this code it is outside the action-step budget. |
+| Maintains concise working memory | Makes a long run easier for a human to inspect. | Repeated rolling summaries can accumulate omission or hallucination. |
+| Low reasoning effort can be cheaper | Appropriate because it is compression, not primary solution work. | A too-weak summarizer can miss technical constraints. |
+
+The failure mode you identified is real: too-frequent compaction can become token laundering. The agent appears to have a small active prompt, but it is quietly making extra LLM calls that consume budget and introduce risk without materially advancing the user task.
+
+#### Tuning the knobs as a Principal Engineer
+
+Use a token budget for the whole run, not only a step limit. The important knobs are related:
+
+| Knob | Increase it when | Decrease it when | Main tradeoff |
+| --- | --- | --- | --- |
+| Trigger threshold | Runs are short; exact history is valuable; summaries are expensive. | Context-window pressure, expensive prefill, or long tool output. | Higher threshold means fewer summaries but larger task prompts. |
+| Recent turns kept verbatim | Latest tool output/code/test result needs exact wording. | Prompt budget is tight and recent turns are verbose. | More retained turns reduces summary loss but costs prompt tokens. |
+| Summary output budget | Task needs a detailed handoff: files, tests, failures, and plan. | Summary is bloated or has little future value. | More tokens preserve detail but reduce savings. |
+| Minimum interval | Summary calls are too frequent or show no net savings. | A few massive tool outputs can quickly overflow context. | Larger interval avoids thrashing but reacts more slowly. |
+| Summary model | Accuracy-sensitive technical work needs faithful compression. | Cost/latency dominates and summaries are simple. | Cheaper model lowers cost but can degrade memory quality. |
+| What is pinned outside summary | Facts are needed for correctness, audit, or safety. | Rarely: only truly redundant data should be unpinned. | Structured pinned state uses context/storage but avoids catastrophic loss. |
+
+A sane policy often has both a **high-water mark** and a **target low-water mark**:
+
+~~~text
+If active prompt exceeds 12,000 tokens:
+  compact enough old history to return near 7,000 tokens,
+  then do not compact again until it exceeds 12,000 tokens.
+
+Do not compact merely because one more message arrived.
+~~~
+
+This hysteresis is better than repeatedly compacting at exactly one threshold. Our code has a basic version through the three-step minimum interval, but it does not yet enforce a precise low-water target.
+
+Measure whether compaction is paying for itself. At minimum, record:
+
+- number of compactions per run;
+- tokens sent to and generated by compaction;
+- task-model input tokens before and after compaction;
+- estimated tokens saved across later task calls;
+- success rate, evaluation score, and regressions caused by missing context;
+- empty/failed summaries and time spent waiting for them.
+
+The correct threshold differs by model price, context window, tool-output size, and expected run length. It should be tuned from real traces, not guessed once.
+
+#### Common production algorithms
+
+Production systems rarely rely on only one summarization technique. Common approaches are:
+
+| Algorithm | Core idea | Strength | Weakness |
+| --- | --- | --- | --- |
+| Hard truncation / sliding window | Drop the oldest messages and keep the last K messages or T tokens. | Cheap, deterministic, no extra LLM call. | Completely loses old facts. |
+| Pinned instructions plus sliding window | Keep system prompt, task, safety state, and selected facts; trim ordinary history. | Preserves critical facts deterministically. | Requires deciding what is critical. |
+| Rolling LLM summary | Summarize old messages, retain latest exact turns, then extend the prior summary later. | Compact and intuitive; this is closest to our code. | Extra LLM cost; recursive-summary drift. |
+| Hierarchical or map-reduce summaries | Summarize chunks, then summarize the summaries or retrieve the right level. | Works for very long histories and audits. | More orchestration and more chances to lose nuance. |
+| Structured state extraction | Extract typed fields such as goal, files changed, tests, constraints, plan, and blockers. | Easier to validate; good for workflows/state machines. | Schema design is work; may miss unmodeled information. |
+| Retrieval-augmented memory | Keep raw events/documents in storage; retrieve only semantically relevant pieces for the current query. | Raw history remains available; scales across sessions. | Retrieval can miss the needed item; embeddings/indexes add complexity. |
+| Deterministic observation compression | Truncate logs, preserve tails/errors, normalize test results, store blobs by hash. | Cheap and faithful for known output types. | Does not understand semantic importance. |
+| Hybrid memory | Pinned structured facts + recent window + rolling summary + retrieval of raw artifacts. | Best balance for complex production agents. | More components to operate and evaluate. |
+
+LangGraph documentation presents the rolling-summary pattern: after messages accumulate, generate/update a summary and retain only recent messages. Its newer summarization node uses a token threshold, a maximum summary budget, and an explicit running summary. It also distinguishes short-term thread state from long-term persistent memory. [LangGraph memory and summarization documentation](https://langchain-ai.github.io/langgraph/how-tos/memory/)
+
+#### What a production-grade design would change
+
+For an agent that edits code or performs other high-consequence work, do not destroy the raw event log just because the model context is compacted. Keep two representations:
+
+~~~text
+Durable audit log:
+  immutable raw model/tool events, timestamps, outputs, artifacts, hashes
+
+Model working context:
+  bounded prompt assembled from pinned state + recent exact turns
+  + structured summary + selectively retrieved raw evidence
+~~~
+
+The first is for debugging, compliance, and replay. The second is for efficient model reasoning. They should not be the same data structure.
+
+A production design would normally:
+
+1. Store exact commands, test results, patch hashes, and policy decisions as structured fields outside summaries.
+2. Pin safety-critical facts and current workflow state; never rely on an LLM summary alone for those.
+3. Keep raw tool output in durable storage and reference it by ID/hash from the active summary.
+4. Use explicit token accounting for both task calls and compaction calls.
+5. Evaluate summarization quality with adversarial cases: conflicting test results, failed edits, long error logs, changed files after verification, and stale plans.
+6. Route summaries to a cheaper model only after measuring factual retention; use a stronger model when a mistaken summary could cause costly work.
+7. Redact secrets before both the task prompt and any stored trace.
+8. Make compaction idempotent or checkpointed so a crash does not leave ambiguous memory state.
+
+#### Short revision answer
+
+Compaction is a **lossy cache transformation for model context**. It is useful when it avoids repeated large prompts or context overflow. It is harmful when it runs too often, loses exact facts, or spends more on summary calls than it saves on future reasoning. The production answer is usually not “summarize everything”; it is “keep an immutable log, pin structured facts, retain recent exact evidence, and compact/retrieve the rest using measured token budgets.”
+
+
 ### Principal-engineer summary
 
 ~~~text
